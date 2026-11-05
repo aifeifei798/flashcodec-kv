@@ -323,7 +323,7 @@ python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
 
 # checkpoints that do not fit on one device (needs accelerate):
 python -m flashcodec.export deepseek-ai/DeepSeek-V2-Lite ./dsv2-lite-fckv \
-    --calib-text calibration.txt --device-map auto --max-gpu-gib 25
+    --calib-text calibration.txt --device-map auto   # 80% of free VRAM by default
 ```
 
 ```text
@@ -377,7 +377,8 @@ smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128),
 and transformers' `expand_kv` rebuilds the per-head keys/values on every
 forward, so only the *stored* cache shrinks — the 4K decode step measured
 954 ms raw vs 959 ms with the codec. When the checkpoint does not fit on one
-device, export with `--device-map auto --max-gpu-gib 25` (needs `accelerate`).
+device, export with `--device-map auto` (needs `accelerate`; it budgets 80% of
+free VRAM plus host RAM, and `--max-gpu-gib` overrides the VRAM figure).
 
 
 ## Transformers integration (real-world tested on Qwen3.5-0.8B)

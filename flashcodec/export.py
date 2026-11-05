@@ -115,10 +115,11 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
     tokenizer + manifest); otherwise the manifest points at
     ``model_id_or_path`` and only the profiles are stored.
 
-    ``device_map="auto"`` (with an optional ``max_memory`` dict, e.g.
-    ``{0: "25GiB", "cpu": "24GiB"}``) loads through accelerate and lets layers
-    spill to host RAM — needed when the checkpoint does not fit on one device.
-    Without it the model is simply moved to ``device``.
+    ``device_map="auto"`` loads through accelerate and lets layers spill to
+    host RAM — needed when the checkpoint does not fit on one device.
+    ``max_memory`` defaults to 80% of free VRAM plus most of host RAM (the full
+    VRAM figure leaves no room for the CUDA context). Without ``device_map`` the
+    model is simply moved to ``device``.
 
     Returns the manifest dict (also written to ``out_dir/flashcodec-kv.json``).
     """
@@ -140,7 +141,8 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_path, local_files_only=local_files_only,
         trust_remote_code=trust_remote_code, dtype=dtype,
-        device_map=device_map, max_memory=max_memory)
+        device_map=device_map,
+        max_memory=max_memory or (_max_memory() if device_map else None))
     if device_map is None:
         model = model.to(device)
     model.eval()
@@ -254,9 +256,9 @@ def load_pretrained(path, device=None, dtype=None, materialization_free=False,
 
     Returns ``(model, tokenizer)`` — ``tokenizer`` is ``None`` when the bundle
     does not carry one.  The cache codec (7-bit by default) is active for
-    ``generate`` / ``forward`` immediately.  ``device_map="auto"`` (plus an
-    optional ``max_memory``) is forwarded to transformers for checkpoints that
-    need to spill beyond one device.
+    ``generate`` / ``forward`` immediately.  ``device_map="auto"`` is forwarded
+    to transformers for checkpoints that need to spill beyond one device;
+    ``max_memory`` defaults to 80% of free VRAM plus most of host RAM.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -273,7 +275,9 @@ def load_pretrained(path, device=None, dtype=None, materialization_free=False,
     model = AutoModelForCausalLM.from_pretrained(
         base, local_files_only=local_files_only,
         trust_remote_code=trust_remote_code, dtype=dtype,
-        device_map=device_map, max_memory=max_memory, **model_kwargs)
+        device_map=device_map,
+        max_memory=max_memory or (_max_memory() if device_map else None),
+        **model_kwargs)
     if device_map is None:
         model = model.to(device)
     model.eval()

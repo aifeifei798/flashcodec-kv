@@ -227,8 +227,8 @@ Read this whole file before making changes.
   and HF materializes the expanded keys/values every forward, so only the stored
   cache shrinks. Same percentage as dense models, far fewer bytes.
 - The 16B checkpoint does not fit in 32 GB next to the CUDA context: export with
-  `--device-map auto --max-gpu-gib 25` (accelerate), or the load tries to stage
-  ~31 GB of weights on the host.
+  `--device-map auto` (accelerate; budgets 80% of free VRAM by default), or the
+  load tries to stage ~31 GB of weights on the host.
 
 ## Negative results (measured; do not re-propose without new data)
 

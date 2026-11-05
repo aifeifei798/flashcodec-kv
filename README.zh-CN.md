@@ -288,7 +288,7 @@ python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
 
 # 单卡放不下的模型（需要 accelerate）：
 python -m flashcodec.export deepseek-ai/DeepSeek-V2-Lite ./dsv2-lite-fckv \
-    --calib-text calibration.txt --device-map auto --max-gpu-gib 25
+    --calib-text calibration.txt --device-map auto   # 默认按空闲显存的 80% 规划
 ```
 
 ```text
@@ -336,7 +336,8 @@ profile → `generate` 直接生效。已经自己加载好模型的，用
 每层 576 vs 4096 个元素），而 transformers 的 `expand_kv` 每次前向都会把每头
 K/V 重新展开，所以缩小的只是**存储的 cache** —— 4K 上下文解码单步实测
 954 ms（原始）vs 959 ms（带 codec）。模型单卡放不下时用
-`--device-map auto --max-gpu-gib 25` 导出（需要 `accelerate`）。
+`--device-map auto` 导出（需要 `accelerate`；默认按空闲显存的 80% + 主机内存规划，
+`--max-gpu-gib` 可覆盖显存那一项）。
 
 
 ## Transformers 集成（Qwen3.5-0.8B 实战验证）
