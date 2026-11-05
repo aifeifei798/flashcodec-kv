@@ -275,6 +275,48 @@ k_hat = png.reconstruct(delta, anchor)
 - `materialization_free=True` 只支持 decode 且 batch=1；批量/padding 推理会自动回退。
 - `quant_bits` 只对 jpeg 有效（png 无损档必须保留 fp32 差分）。
 
+### 9. 导出成 7-bit 模型（校准 bundle）
+
+flashcodec 压的是**推理时的 KV cache**，不重量化模型权重（权重仍是 bf16）。
+"导出 7-bit 模型" = 原权重 + 一份 `flashcodec-kv.json` 侧车，里面是量化档位和
+逐层、逐流（K/V）的通道 profile：
+
+```bash
+python -m flashcodec.export Qwen/Qwen3-0.6B ./qwen3-0.6b-fckv \
+    --calib-text calibration.txt          # 加 --save-weights 打成自包含目录
+python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
+```
+
+```text
+format   : flashcodec-kv-model v1
+base     : Qwen/Qwen3-0.6B  (weights referenced)
+codec    : jpeg block=8 keep_freqs=8 quant_bits=7
+calib    : 2048 tokens, q0.95
+layers   : 28
+profiles : [(8, 128)]
+storage  : ~45.3% of bf16 KV (one stream)
+```
+
+加载（`flashcodec-export` 是同一个命令的 console script）：
+
+```python
+from flashcodec import load_pretrained
+
+model, tok = load_pretrained("./qwen3-0.6b-fckv")
+inputs = tok("Explain KV cache compression in one sentence.",
+             return_tensors="pt").to(model.device)
+out = model.generate(**inputs, max_new_tokens=128)
+print(model._flashcodec["caches"][0].storage_bytes())   # 实际归档占用
+```
+
+`load_pretrained` 依次完成：加载权重 → `apply_flash_codec` 套上 7-bit 档和逐层
+profile → `generate` 直接生效。已经自己加载好模型的，用
+`apply_export(model, read_manifest(path))`；要重做成别的档位，改 `--quant-bits`
+重新导出即可（profile 与档位无关，可复用）。
+
+实测（Qwen3-0.6B，2048 token 校准）：bundle 313 KB / 28 层，7-bit 档 45.3%，
+同一 prompt 下生成结果与未压缩模型**逐 token 一致**。
+
 ## Transformers 集成（Qwen3.5-0.8B 实战验证）
 
 混合架构（如 Qwen3.5：18 层线性注意力 + 6 层全注意力）自动处理——
@@ -560,9 +602,10 @@ flashcodec/
 │   ├── cache.py           # CodecKVCache：raw 尾 + 倍增预分配归档，全量/增量双接口
 │   ├── calibrate.py       # 逐层/逐流通道 profile（一次前向）
 │   ├── storage.py         # save_archive / load_archive（zlib/zstd，落盘与传输）
+│   ├── export.py          # export_model / load_pretrained（7-bit 校准 bundle）
 │   ├── attention.py       # 免物化解码 attention（系数域计算）
 │   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
-├── tests/                 # jpeg / png / causal / attention / 校准位深 / 存档 六组测试
+├── tests/                 # jpeg / png / causal / attention / 校准位深 / 存档 / 导出 七组测试
 ├── benchmarks/            # 显存/存储、PSNR/余弦、困惑度+校准、offload/NVDEC
 ├── docs/                  # 实测对比（vs llama.cpp KV 量化）
 ├── demo/                  # Gradio 左右对比 chat
@@ -591,6 +634,7 @@ python tests/test_calibrated_bits.py # 2..8 bit 位打包往返、校准 profile
                                     # 打包归档仍满足因果性、Triton == torch
 python tests/test_storage.py        # 存档逐位往返（CodecKVCache + FlashCodecCache）、
                                     # 压缩后确实变小、多层归档必须带 config
+python tests/test_export.py         # manifest 往返、profile 重载、patched 生成、占用比
 ```
 
 ## 稳定性（1.x）

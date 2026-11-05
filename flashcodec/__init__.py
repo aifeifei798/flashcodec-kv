@@ -23,7 +23,18 @@ from .patch_attention import apply_codec_attention, codec_attention_stats, \
     remove_codec_attention
 from .storage import load_archive, save_archive
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+_EXPORT_API = ("export_model", "load_pretrained", "read_manifest", "apply_export")
+
+
+def __getattr__(name):
+    # `flashcodec.export` is imported lazily: importing it eagerly makes
+    # `python -m flashcodec.export` a double import (runpy warning).
+    if name in _EXPORT_API:
+        from . import export as _export
+        return getattr(_export, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "apply_flash_codec", "remove_flash_codec", "undo_flash_codec",
@@ -35,6 +46,7 @@ __all__ = [
     "dct_basis", "dct_compress", "dct_decompress",
     "quantize_coeffs", "dequantize_coeffs", "pack_coeffs", "unpack_coeffs",
     "calibrate_channel_scales", "channel_scale_from_kv",
+    "export_model", "load_pretrained", "read_manifest", "apply_export",
     "save_archive", "load_archive",
     "png_filter", "png_reconstruct",
     "__version__",

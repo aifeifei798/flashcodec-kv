@@ -309,6 +309,51 @@ Tensor contract: `(B, H, S, D)`, compression axis `dim=-2`. The functional API
   generation falls back automatically.
 - `quant_bits` is jpeg-only (the png lossless tier must keep fp32 deltas).
 
+### 9. Export a 7-bit model bundle
+
+flashcodec compresses the **KV cache at inference time**; the weights are never
+quantized (they stay bf16). "Exporting a 7-bit model" therefore means the
+original checkpoint plus a `flashcodec-kv.json` sidecar carrying the codec tier
+and the per-layer, per-stream (K/V) channel profiles:
+
+```bash
+python -m flashcodec.export Qwen/Qwen3-0.6B ./qwen3-0.6b-fckv \
+    --calib-text calibration.txt        # add --save-weights for a self-contained dir
+python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
+```
+
+```text
+format   : flashcodec-kv-model v1
+base     : Qwen/Qwen3-0.6B  (weights referenced)
+codec    : jpeg block=8 keep_freqs=8 quant_bits=7
+calib    : 2048 tokens, q0.95
+layers   : 28
+profiles : [(8, 128)]
+storage  : ~45.3% of bf16 KV (one stream)
+```
+
+Load it (`flashcodec-export` is the same command as a console script):
+
+```python
+from flashcodec import load_pretrained
+
+model, tok = load_pretrained("./qwen3-0.6b-fckv")
+inputs = tok("Explain KV cache compression in one sentence.",
+             return_tensors="pt").to(model.device)
+out = model.generate(**inputs, max_new_tokens=128)
+print(model._flashcodec["caches"][0].storage_bytes())   # actual archive
+```
+
+`load_pretrained` loads the weights, applies `apply_flash_codec` with the 7-bit
+tier and the stored profiles, and generation uses it immediately. If you loaded
+the model yourself, use `apply_export(model, read_manifest(path))`. To export a
+different tier just change `--quant-bits` — the profiles are tier-independent
+and reused.
+
+Measured on Qwen3-0.6B with 2048 calibration tokens: 313 KB for 28 layers,
+45.3% of bf16 KV, and the generated tokens are identical to the uncompressed
+model on the same prompt.
+
 ## Transformers integration (real-world tested on Qwen3.5-0.8B)
 
 Hybrid architectures (e.g. Qwen3.5: 18 linear-attention layers + 6
@@ -632,9 +677,10 @@ flashcodec/
 │   ├── cache.py           # CodecKVCache: raw tail + capacity-doubled archives
 │   ├── calibrate.py       # per-layer/stream channel profile (one forward pass)
 │   ├── storage.py         # save_archive / load_archive (zlib/zstd, disk & transport)
+│   ├── export.py          # export_model / load_pretrained (7-bit calibrated bundle)
 │   ├── attention.py       # materialization-free decode attention (coefficient domain)
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
-├── tests/                 # jpeg / png / causal / attention / calibrated-bits / storage
+├── tests/                 # jpeg / png / causal / attention / calibrated-bits / storage / export
 ├── benchmarks/            # storage, PSNR/cosine, ppl+calibration, offload/NVDEC
 ├── docs/                  # measured comparisons (vs llama.cpp KV quantization)
 ├── demo/                  # Gradio side-by-side chat
@@ -663,6 +709,8 @@ python tests/test_calibrated_bits.py # bit-packing round trip (2..8 bits), calib
                                     # error, packed archives stay causal, Triton == torch
 python tests/test_storage.py        # save/load bitwise round trip (CodecKVCache + FlashCodecCache),
                                     # compressed smaller than raw, multi-layer needs a config
+python tests/test_export.py         # manifest round trip, profile reload, patched generation,
+                                    # archive ratio
 ```
 
 ## Stability (1.x)

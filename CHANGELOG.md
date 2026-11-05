@@ -57,6 +57,23 @@ placeholder package).
   0.371 ms, b=8 + profile 0.414 ms, b=7 + profile 0.767 ms (the gather unpack
   is ~2x the plain int8 load; still far below the materialized path).
 
+## [1.2.0] - 2026-11-05
+
+### Added
+
+- **Model bundles** (`flashcodec/export.py`): `export_model()` calibrates a
+  checkpoint once and writes a `flashcodec-kv.json` sidecar holding the codec
+  tier and the per-layer / per-stream channel profiles (base64 fp32);
+  `load_pretrained()` and `apply_export()` restore them, so a 7-bit KV cache is
+  active right after loading. Weights are untouched — this exports the
+  *KV-cache* tier, not weight quantization. CLI:
+  `flashcodec-export` / `python -m flashcodec.export`, plus `--inspect`.
+  Measured on Qwen3-0.6B, 2048-token calibration: bundle 313 KB for 28 layers,
+  45.3% of bf16 KV, and the generated tokens are identical to the uncompressed
+  model on the same prompt.
+- `tests/test_export.py` (CI): manifest round trip, profile reload, patched
+  generation, storage ratio.
+
 ## [Unreleased]
 
 ### Added

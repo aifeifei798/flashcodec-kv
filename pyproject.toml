@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashcodec-kv"
-version = "1.1.0"
+version = "1.2.0"
 description = "Compress Transformer time-series KV cache tensors as high-dimensional multimedia image signals: JPEG-style lossy frequency domain (DCT) plus PNG-style lossless time-domain deltas"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = ["torch>=2.0"]
+
+[project.scripts]
+flashcodec-export = "flashcodec.export:main"
 
 [project.optional-dependencies]
 hf = ["transformers>=5.20"]

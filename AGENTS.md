@@ -198,6 +198,20 @@ Read this whole file before making changes.
   concatenates a stream's parts and zlibs them. Loading re-packs; pass
   `device="cuda"` (CPU packing is ~40 Mval/s, GPU ~100x faster).
 
+## Model bundles (`flashcodec/export.py`, 1.2)
+
+- "Export a 7-bit model" means **the KV-cache tier**, not weight quantization:
+  the checkpoint is unchanged and a `flashcodec-kv.json` sidecar carries the
+  codec config + the per-layer, per-stream profiles (base64 fp32, ~313 KB for a
+  28-layer model). Do not describe it as a quantized checkpoint in docs — that
+  would be wrong and users would expect smaller weights.
+- `export_model(..., save_weights=False)` only references the base checkpoint;
+  `save_weights=True` writes a self-contained dir (weights + tokenizer +
+  manifest). `load_pretrained()` resolves `base_model` when weights are not
+  included.
+- `flashcodec.export` is imported lazily from `__init__` (`__getattr__`): an
+  eager import turns `python -m flashcodec.export` into a runpy double import.
+
 ## Negative results (measured; do not re-propose without new data)
 
 - **2D DCT across heads is useless.** At an equal coefficient budget (16 of 64)
@@ -277,5 +291,6 @@ Read this whole file before making changes.
   `FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
   `codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`,
   `channel_scale` / `channel_scale_v`, `calibrate_channel_scales`,
-  `save_archive` / `load_archive`. Add options with defaults; breaking changes
+  `save_archive` / `load_archive`, `export_model` / `load_pretrained` /
+  `read_manifest` / `apply_export`. Add options with defaults; breaking changes
   need a 2.0.
