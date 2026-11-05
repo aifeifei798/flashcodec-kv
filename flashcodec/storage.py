@@ -33,6 +33,11 @@ try:                                    # optional, no hard dependency
 except Exception:                       # pragma: no cover
     _zstd = None
 
+try:                                    # numpy is optional for torch
+    import numpy as _np
+except Exception:                       # pragma: no cover
+    _np = None
+
 __all__ = ["save_archive", "load_archive"]
 
 _MAGIC = b"FCKV"
@@ -47,8 +52,10 @@ def _dtype_name(dtype):
 
 def _tensor_bytes(t):
     """Tensor -> raw bytes (contiguous, dtype-agnostic)."""
-    t = t.detach().cpu().contiguous()
-    return t.reshape(-1).view(torch.uint8).numpy().tobytes()
+    t = t.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    if _np is not None:
+        return t.numpy().tobytes()
+    return bytes(t.tolist())          # numpy-free fallback (slower)
 
 
 def _tensor_from_bytes(buf, shape, dtype_name):
