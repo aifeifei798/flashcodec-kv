@@ -320,6 +320,10 @@ and the per-layer, per-stream (K/V) channel profiles:
 python -m flashcodec.export Qwen/Qwen3-0.6B ./qwen3-0.6b-fckv \
     --calib-text calibration.txt        # add --save-weights for a self-contained dir
 python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
+
+# checkpoints that do not fit on one device (needs accelerate):
+python -m flashcodec.export deepseek-ai/DeepSeek-V2-Lite ./dsv2-lite-fckv \
+    --calib-text calibration.txt --device-map auto --max-gpu-gib 25
 ```
 
 ```text
@@ -361,6 +365,19 @@ layers, 133 KB bundle, token-identical generation); sliding-window layers keep
 the native cache and get no codec. Architectures without a KV cache
 (Mamba/RWKV) fail loudly. Custom architectures need `--trust-remote-code`, and
 the calibration length is clamped to the model's `max_position_embeddings`.
+
+**MLA (DeepSeek-V2/V3)**: the cache stores one latent per token per layer — the
+`kv_lora_rank` compressed key plus the shared RoPE key (576 elements for
+V2-Lite) — instead of per-head K/V, and flashcodec compresses exactly that
+tensor, so MLA works unchanged. Measured on the real DeepSeek-V2-Lite
+checkpoint (`benchmarks/bench_mla.py`, 27 layers): 7-bit + profile is 44.4% of
+the bf16 latent cache, ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), and the
+generated tokens are identical. Two caveats: the MLA latent is already ~7x
+smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128),
+and transformers' `expand_kv` rebuilds the per-head keys/values on every
+forward, so only the *stored* cache shrinks — the 4K decode step measured
+954 ms raw vs 959 ms with the codec. When the checkpoint does not fit on one
+device, export with `--device-map auto --max-gpu-gib 25` (needs `accelerate`).
 
 
 ## Transformers integration (real-world tested on Qwen3.5-0.8B)
@@ -690,7 +707,7 @@ flashcodec/
 │   ├── attention.py       # materialization-free decode attention (coefficient domain)
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
 ├── tests/                 # jpeg / png / causal / attention / calibrated-bits / storage / export
-├── benchmarks/            # storage, PSNR/cosine, ppl+calibration, offload/NVDEC
+├── benchmarks/            # storage, PSNR/cosine, ppl+calibration, offload/NVDEC, MLA
 ├── docs/                  # measured comparisons (vs llama.cpp KV quantization)
 ├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots

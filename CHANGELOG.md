@@ -78,6 +78,15 @@ placeholder package).
 
 ### Added
 
+- `benchmarks/bench_mla.py`: flashcodec on an MLA model, measured on the real
+  DeepSeek-V2-Lite checkpoint (cache = 512-d latent + 64-d rope key per
+  token/layer, 27 layers). 7-bit + profile is 44.4% of the bf16 latent cache,
+  ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), generated tokens identical.
+  Decode step at 4K: 954 ms raw vs 959 ms compressed, because `expand_kv`
+  materializes the per-head keys/values on every forward regardless.
+- `export_model` / `load_pretrained` take `device_map` / `max_memory`, and the
+  CLI gains `--device-map auto` / `--max-gpu-gib`, so 16B-class checkpoints can
+  be calibrated with layers spilling to host RAM (needs `accelerate`).
 - `benchmarks/bench_offload.py`: measures whether V can live on host RAM / a
   video stream. Warm pinned H2D is 10.7 GB/s (Gen4 x8); the decode step is
   launch-bound (16.1 -> 17.9 ms from 4K to 64K) while the V transfer grows

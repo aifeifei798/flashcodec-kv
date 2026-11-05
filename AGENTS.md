@@ -212,6 +212,24 @@ Read this whole file before making changes.
 - `flashcodec.export` is imported lazily from `__init__` (`__getattr__`): an
   eager import turns `python -m flashcodec.export` into a runpy double import.
 
+## MLA models (DeepSeek-V2/V3, measured on V2-Lite)
+
+- The cache holds `keys (B,1,S,kv_lora_rank)` (the compressed latent) and
+  `values (B,1,S,qk_rope_head_dim)` (the shared rope key) — head count 1, so the
+  codec sees head_dim 512 / 64 and compresses it unchanged. `expand_kv` rebuilds
+  per-head K/V from the reconstructed latent afterwards.
+- Measured (`benchmarks/bench_mla.py`, 27 layers, 8 x 512 windows): 7-bit +
+  profile 44.4% of the bf16 latent, ppl 15.2497 -> 15.2369; 6-bit + profile
+  15.3142; generated tokens identical. 4K decode step 954 ms raw vs 959 ms
+  compressed.
+- **Do not sell this as a large memory win**: the MLA latent is already ~7x
+  smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128)
+  and HF materializes the expanded keys/values every forward, so only the stored
+  cache shrinks. Same percentage as dense models, far fewer bytes.
+- The 16B checkpoint does not fit in 32 GB next to the CUDA context: export with
+  `--device-map auto --max-gpu-gib 25` (accelerate), or the load tries to stage
+  ~31 GB of weights on the host.
+
 ## Negative results (measured; do not re-propose without new data)
 
 - **2D DCT across heads is useless.** At an equal coefficient budget (16 of 64)

@@ -107,12 +107,18 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
                  block_size=8, calib_texts=None, calib_ids=None,
                  calib_tokens=2048, quantile=0.95, save_weights=False,
                  dtype=torch.bfloat16, device="cuda", overwrite=False,
-                 local_files_only=False, trust_remote_code=False):
+                 local_files_only=False, trust_remote_code=False,
+                 device_map=None, max_memory=None):
     """Calibrate ``model_id_or_path`` and write a bundle to ``out_dir``.
 
     ``save_weights=True`` writes a self-contained directory (model +
     tokenizer + manifest); otherwise the manifest points at
     ``model_id_or_path`` and only the profiles are stored.
+
+    ``device_map="auto"`` (with an optional ``max_memory`` dict, e.g.
+    ``{0: "25GiB", "cpu": "24GiB"}``) loads through accelerate and lets layers
+    spill to host RAM — needed when the checkpoint does not fit on one device.
+    Without it the model is simply moved to ``device``.
 
     Returns the manifest dict (also written to ``out_dir/flashcodec-kv.json``).
     """
@@ -133,7 +139,13 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
         pass
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_path, local_files_only=local_files_only,
-        trust_remote_code=trust_remote_code, dtype=dtype).to(device).eval()
+        trust_remote_code=trust_remote_code, dtype=dtype,
+        device_map=device_map, max_memory=max_memory)
+    if device_map is None:
+        model = model.to(device)
+    model.eval()
+    if device_map is not None:
+        device = model.device
 
     maxpos = getattr(model.config, "max_position_embeddings", None)
     if maxpos and calib_tokens > int(maxpos):
@@ -237,12 +249,14 @@ def apply_export(model, manifest, materialization_free=False):
 
 def load_pretrained(path, device=None, dtype=None, materialization_free=False,
                     local_files_only=False, trust_remote_code=False,
-                    **model_kwargs):
+                    device_map=None, max_memory=None, **model_kwargs):
     """Load an exported bundle (or plain model dir + sidecar) and patch it.
 
     Returns ``(model, tokenizer)`` — ``tokenizer`` is ``None`` when the bundle
     does not carry one.  The cache codec (7-bit by default) is active for
-    ``generate`` / ``forward`` immediately.
+    ``generate`` / ``forward`` immediately.  ``device_map="auto"`` (plus an
+    optional ``max_memory``) is forwarded to transformers for checkpoints that
+    need to spill beyond one device.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -259,7 +273,9 @@ def load_pretrained(path, device=None, dtype=None, materialization_free=False,
     model = AutoModelForCausalLM.from_pretrained(
         base, local_files_only=local_files_only,
         trust_remote_code=trust_remote_code, dtype=dtype,
-        **model_kwargs).to(device)
+        device_map=device_map, max_memory=max_memory, **model_kwargs)
+    if device_map is None:
+        model = model.to(device)
     model.eval()
     tokenizer = None
     try:
@@ -287,14 +303,33 @@ def _inspect(path):
     print(f"layers   : {len(m['layers'])} "
           f"({', '.join(sorted(m['layers'], key=int)[:8])}"
           f"{' ...' if len(m['layers']) > 8 else ''})")
-    sizes = sorted({tuple(e['channel_scale']['shape'])
-                    for e in m['layers'].values() if 'channel_scale' in e})
-    print(f"profiles : {sizes}")
+    ks = sorted({tuple(e['channel_scale']['shape'])
+                 for e in m['layers'].values() if 'channel_scale' in e})
+    vs = sorted({tuple(e['channel_scale_v']['shape'])
+                 for e in m['layers'].values() if 'channel_scale_v' in e})
+    print(f"profiles : K {ks}" + (f", V {vs}" if vs else ""))
     k, b = c['keep_freqs'], c['quant_bits']
-    dims = [s[1] for s in sizes] or [128]
+    dims = sorted({s[1] for s in ks + vs}) or [128]
     for D in dims:
         print(f"storage  : ~{(k*D*b/8 + k*4)/(c['block_size']*D*2)*100:.1f}% "
               f"of bf16 KV (head_dim={D}, one stream)")
+
+
+def _max_memory(max_gpu_gib=None):
+    """Budget for ``--device-map auto``: a VRAM cap plus most of host RAM."""
+    if max_gpu_gib is None:
+        free = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+        max_gpu_gib = max(1, int(free / 2**30 * 0.8))
+    cpu = 24
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    cpu = max(4, int(int(line.split()[1]) / 1024 / 1024 * 0.8))
+                    break
+    except OSError:
+        pass
+    return {0: f"{max_gpu_gib}GiB", "cpu": f"{cpu}GiB"}
 
 
 def main(argv=None):
@@ -324,6 +359,11 @@ def main(argv=None):
                     help="only use locally cached model files")
     ap.add_argument("--trust-remote-code", action="store_true",
                     help="needed by some custom architectures")
+    ap.add_argument("--device-map", default=None,
+                    help="pass 'auto' (needs accelerate) to let layers spill to "
+                         "host RAM when the checkpoint does not fit on one device")
+    ap.add_argument("--max-gpu-gib", type=int, default=None,
+                    help="VRAM budget for --device-map auto (default: 80%% of free)")
     args = ap.parse_args(argv)
 
     if args.inspect:
@@ -334,13 +374,18 @@ def main(argv=None):
     texts = None
     if args.calib_text:
         texts = [Path(p).read_text(encoding="utf-8") for p in args.calib_text]
+    max_memory = None
+    if args.device_map:
+        max_memory = _max_memory(args.max_gpu_gib)
     export_model(args.model, args.out,
                  keep_freqs=args.keep_freqs, quant_bits=args.quant_bits,
                  block_size=args.block_size, calib_texts=texts,
                  calib_tokens=args.calib_tokens, quantile=args.quantile,
                  save_weights=args.save_weights,
                  dtype=getattr(torch, args.dtype), device=args.device,
-                 overwrite=args.overwrite, local_files_only=args.offline)
+                 overwrite=args.overwrite, local_files_only=args.offline,
+                 trust_remote_code=args.trust_remote_code,
+                 device_map=args.device_map, max_memory=max_memory)
     print(f"\nload it with:\n  from flashcodec import load_pretrained\n"
           f"  model, tok = load_pretrained({args.out!r})")
     return 0
