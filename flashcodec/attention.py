@@ -54,7 +54,10 @@ def _stored_rows(stream, dtype=torch.float32):
     if codec.name == "jpeg":
         rows = stream._coeffs[:, :, :n]
         if codec.quantized:
-            return dequantize_coeffs(rows, stream._scales[:, :, :n], dtype)
+            return dequantize_coeffs(
+                rows, stream._scales[:, :, :n], dtype,
+                bits=codec.quant_bits, channel_scale=codec.channel_scale,
+                head_dim=stream.head_dim)
         return rows
     # png: anchor + deltas are already the stored rows; stack them on the row axis
     return torch.cat([stream._anchors[:, :, :n].unsqueeze(-2).float(),

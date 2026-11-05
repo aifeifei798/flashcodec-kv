@@ -35,7 +35,9 @@ def find_attention_modules(model):
 def _make_factory(mode, block_size, kwargs, sink, config=None):
     codec_kw = dict(keep_freqs=kwargs.get("keep_freqs", 2),
                     keep_ratio=kwargs.get("keep_ratio", 1.0),
-                    quant_bits=kwargs.get("quant_bits", 0))
+                    quant_bits=kwargs.get("quant_bits", 0),
+                    channel_scale=kwargs.get("channel_scale"),
+                    channel_scale_v=kwargs.get("channel_scale_v"))
     per_layer = kwargs.get("per_layer")
     if HAS_HF_CACHE:
         def factory():

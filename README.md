@@ -169,22 +169,87 @@ remove_flash_codec(model)                            # back to the stock cache
 ```
 
 Accepted kwargs: `keep_freqs` (jpeg), `keep_ratio` (png), `quant_bits`
-(`0` or `8`), `per_layer={idx: {...}}` for a calibrated per-layer budget, and
-`materialization_free=True` for the decode path below.
+(`0` or `2..8`; below 8 the coefficients are bit-packed), `channel_scale` /
+`channel_scale_v` (calibrated channel profiles), `per_layer={idx: {...}}` for a
+per-layer budget, and `materialization_free=True` for the decode path below.
 
 ### 4. Picking a tier
 
-| goal | config | storage (bf16 KV) | cost |
+| goal | config | storage (bf16 KV) | cost (measured, Qwen3-0.6B) |
 |---|---|---|---|
 | bitwise-identical output | `mode="png", keep_ratio=1.0` | ~1.9× | storage only (fp32 deltas) |
-| **safe default** | `mode="jpeg", keep_freqs=8, quant_bits=8` | ~52% | +2% ppl on a dense model, 100% token match on the hybrid model |
-| aggressive (few layers compressed) | `keep_freqs=2` / `4` | 25–50% | truncation compounds per layer |
+| **recommended (calibrated)** | `keep_freqs=8, quant_bits=7` + profile | **~45%** | +0.025 ppl |
+| tighter (calibrated) | `keep_freqs=8, quant_bits=6` + profile | **~39%** | +0.249 ppl |
+| safe without calibration | `keep_freqs=8, quant_bits=8` | ~52% | +0.52 ppl |
+| 7-bit without calibration | `keep_freqs=8, quant_bits=7` | ~45% | +2.34 ppl |
+| truncation (few codec layers) | `keep_freqs=2` / `4` | 25–50% | collapses on dense models |
 | maximum | `keep_freqs=2, quant_bits=8` | ~13% | collapses on dense models |
 
-Rule of thumb: `keep_freqs = block_size` (full DCT basis) + `quant_bits=8` is
-the only lossy setting that stays close on **every** layer. `keep_freqs <
-block_size` only pays off when few layers carry a codec (hybrid models); the
-measured per-tier tables are in [Benchmarks](#benchmarks-measured-b2-h8-s2048-d64-random-walk-autocorrelated-signal-fp32).
+Rule of thumb: `keep_freqs = block_size` (full DCT basis) is the premise;
+**dropping bits beats truncating frequencies**, but only after the channel
+profile is calibrated — below 7 bits the archive collapses without it. Hybrid
+models (few codec layers) tolerate truncation much better; measured `k=4` is
+even slightly better than the baseline there.
+
+#### 4.1 Calibrated channel profile (the prerequisite for 7-bit)
+
+Each coefficient row has **one** fp32 scale shared by all 128 channels, but
+per-channel magnitudes differ by orders of magnitude, so most quantizer levels
+are spent on a handful of loud channels. `calibrate_channel_scales` runs one
+forward pass (1–2k tokens) and estimates a static `(keep_freqs, head_dim)` table
+per layer, separately for K and V:
+
+```python
+from flashcodec import calibrate_channel_scales
+
+ids = tokenizer(calib_text, return_tensors="pt").input_ids.to("cuda")
+calib = calibrate_channel_scales(model, ids, keep_freqs=8)   # one forward
+apply_flash_codec(model, mode="jpeg", keep_freqs=8, quant_bits=7,
+                  per_layer=calib)
+```
+
+Same Qwen3-0.6B, 16 x 512-token windows, profile calibrated on a disjoint
+2048-token slice:
+
+| tier | ppl | dppl | storage |
+|---|---|---|---|
+| baseline | 31.1504 | — | 100% |
+| k=8 b=8 | 31.6745 | +0.524 | 51.6% |
+| k=8 b=8 + profile | 31.1210 | −0.029 | 51.6% |
+| k=8 b=7 | 33.4916 | +2.341 | 45.3% |
+| **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
+| k=8 b=6 | 47.2046 | +16.05 | 39.1% |
+| k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+
+Hybrid Qwen3.5-0.8B (only 6/24 layers carry a codec, baseline 23.5318):
+b=7 + profile +0.015, b=6 + profile −0.010. Reproduce with
+`python benchmarks/bench_calibrated.py` (windows are built from the repository's
+own markdown; the calibration slice never overlaps the eval windows).
+
+The profile is a codec constant, so decode pays one broadcast multiply:
+at 64K / k=8 the Triton path goes 0.371 -> 0.414 ms per layer; 7-bit adds the
+gather unpack on top (0.767 ms per layer). `per_layer` may cover only some
+layers.
+
+#### 4.2 Archiving: entropy coding is for disk / transport only
+
+On the hot path the int8 coefficients are read by the attention kernel directly,
+so re-decoding an entropy stream every step would lose; on disk the symbols
+carry ~6.8/8 bits of entropy, so compressing is free money. `save_archive`
+compresses the logical int8 stream + scales + tail (zstd when importable,
+otherwise zlib):
+
+```python
+from flashcodec import save_archive, load_archive
+
+stats = save_archive(cache, "ctx.fckv")   # {"raw_bytes","stored_bytes","ratio"}
+cache2 = load_archive("ctx.fckv", config=model.config, device="cuda")
+```
+
+28-layer Qwen3-0.6B, 4001 tokens, k=8 b=7 + profile: 208.0 MB in memory ->
+181.6 MB on disk (76.7% of the logical payload, 39.6% of the bf16 KV), bitwise
+round trip; save 5.0 s, load 13.2 s on CPU / 1.46 s with `device="cuda"` (the
+7-bit re-pack is ~100x faster on the GPU).
 
 ### 5. Materialization-free decode (no KV view)
 

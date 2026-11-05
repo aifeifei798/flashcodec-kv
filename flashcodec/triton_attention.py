@@ -33,7 +33,7 @@ if HAS_TRITON:
 
     @triton.jit(do_not_specialize=["nb", "nr", "chunk", "ns"])
     def _attn_split_kernel(
-        Q, K, V, KS, VS, KR, VR, A,
+        Q, K, V, KS, VS, KR, VR, KG, VG, A,
         PM, PL, PA,
         nb, nr, chunk, ns,
         q_sb, q_sh, q_sq, q_sd,
@@ -45,6 +45,10 @@ if HAS_TRITON:
         SROWS: tl.constexpr, RTOK: tl.constexpr, DIM: tl.constexpr,
         BDIM: tl.constexpr, HK: tl.constexpr, GFACT: tl.constexpr,
         K_INT8: tl.constexpr, V_INT8: tl.constexpr, HAS_RAW: tl.constexpr,
+        K_PACKED: tl.constexpr, V_PACKED: tl.constexpr,
+        K_BITS: tl.constexpr, V_BITS: tl.constexpr,
+        KPD: tl.constexpr, VPD: tl.constexpr,
+        K_CHAN: tl.constexpr, V_CHAN: tl.constexpr,
         SCALE: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -70,12 +74,29 @@ if HAS_TRITON:
         end = tl.minimum(start + chunk, nb)
         for n in range(start, end):
             kbase = b * k_sb + h * k_sh + n * k_sn
-            rows = tl.load(K + kbase + s[:, None] * k_ss + d[None, :] * k_sd,
-                           mask=dm[None, :], other=0.0).to(tl.float32)
+            if K_PACKED:                      # MSB-first bit stream, 8 values/byte
+                t0 = d[None, :] * K_BITS
+                j0 = t0 >> 3
+                p0 = t0 & 7
+                kptr = K + kbase + s[:, None] * k_ss
+                b0 = tl.load(kptr + j0, mask=dm[None, :], other=0).to(tl.int32)
+                b1 = tl.load(kptr + j0 + 1,
+                             mask=dm[None, :] & (j0 + 1 < KPD),
+                             other=0).to(tl.int32)
+                u = (((b0 << 8) | b1) >> (16 - p0 - K_BITS)) & ((1 << K_BITS) - 1)
+                rows = u.to(tl.float32) - (1 << (K_BITS - 1))
+            else:
+                rows = tl.load(K + kbase + s[:, None] * k_ss
+                               + d[None, :] * k_sd,
+                               mask=dm[None, :], other=0.0).to(tl.float32)
             if K_INT8:
                 ksc = tl.load(KS + b * ks_sb + h * ks_sh + n * ks_sn
                               + s * ks_ss)
                 rows = rows * ksc[:, None]
+            if K_CHAN:                        # calibrated per-channel profile
+                gk = tl.load(KG + s[:, None] * DIM + d[None, :],
+                             mask=dm[None, :], other=0.0)
+                rows = rows * gk
             sj = tl.sum(rows * q[None, :], axis=1)            # (S,)
             logits = tl.sum(a * sj[None, :], axis=1) * SCALE  # (R,)
 
@@ -86,12 +107,29 @@ if HAS_TRITON:
 
             w = tl.sum(p[:, None] * a, axis=0)                # (S,)
             vbase = b * v_sb + h * v_sh + n * v_sn
-            vrows = tl.load(V + vbase + s[:, None] * v_ss + d[None, :] * v_sd,
-                            mask=dm[None, :], other=0.0).to(tl.float32)
+            if V_PACKED:
+                t0 = d[None, :] * V_BITS
+                j0 = t0 >> 3
+                p0 = t0 & 7
+                vptr = V + vbase + s[:, None] * v_ss
+                c0 = tl.load(vptr + j0, mask=dm[None, :], other=0).to(tl.int32)
+                c1 = tl.load(vptr + j0 + 1,
+                             mask=dm[None, :] & (j0 + 1 < VPD),
+                             other=0).to(tl.int32)
+                u = (((c0 << 8) | c1) >> (16 - p0 - V_BITS)) & ((1 << V_BITS) - 1)
+                vrows = u.to(tl.float32) - (1 << (V_BITS - 1))
+            else:
+                vrows = tl.load(V + vbase + s[:, None] * v_ss
+                                + d[None, :] * v_sd,
+                                mask=dm[None, :], other=0.0).to(tl.float32)
             if V_INT8:
                 vsc = tl.load(VS + b * ks_sb + h * ks_sh + n * ks_sn
                               + s * ks_ss)
                 vrows = vrows * vsc[:, None]
+            if V_CHAN:
+                gv = tl.load(VG + s[:, None] * DIM + d[None, :],
+                             mask=dm[None, :], other=0.0)
+                vrows = vrows * gv
             acc = acc * alpha + tl.sum(w[:, None] * vrows, axis=0)
             m_i = m_new
 
@@ -175,8 +213,19 @@ def codec_decode_attention_triton(query, key_stream, value_stream,
     scale = D ** -0.5 if scale is None else scale
 
     krows, vrows = key_stream._coeffs, value_stream._coeffs
+    vcodec = value_stream.codec
     int8 = codec.quantized
     ks_t, vs_t = key_stream._scales, value_stream._scales
+    k_packed, v_packed = codec.packed, vcodec.packed
+    kg = key_stream.codec.channel_scale
+    vg = vcodec.channel_scale
+    if kg is not None:
+        kg = kg.to(device=query.device, dtype=torch.float32).contiguous()
+    if vg is not None:
+        vg = vg.to(device=query.device, dtype=torch.float32).contiguous()
+    k_chan, v_chan = kg is not None and int8, vg is not None and int8
+    kpd = codec.archived_dim(D) if k_packed else D
+    vpd = vcodec.archived_dim(D) if v_packed else D
     if basis is None:
         from .attention import block_basis
         basis = block_basis(codec, R, device=query.device, dtype=torch.float32)
@@ -200,6 +249,7 @@ def codec_decode_attention_triton(query, key_stream, value_stream,
         query, krows, vrows, ks_t if int8 else dummy,
         vs_t if int8 else dummy,
         raw_k if has_raw else dummy, raw_v if has_raw else dummy,
+        kg if k_chan else dummy, vg if v_chan else dummy,
         basis, pm, pl, pa,
         n, nr, chunk, ns,
         *_strides(query),
@@ -210,6 +260,11 @@ def codec_decode_attention_triton(query, key_stream, value_stream,
         _strides(pa)[1], _strides(pa)[2],
         SROWS=S, RTOK=R, DIM=D, BDIM=BD, HK=Hk, GFACT=G,
         K_INT8=int8, V_INT8=int8, HAS_RAW=has_raw,
+        K_PACKED=k_packed, V_PACKED=v_packed,
+        K_BITS=codec.quant_bits if int8 else 8,
+        V_BITS=vcodec.quant_bits if int8 else 8,
+        KPD=kpd, VPD=vpd,
+        K_CHAN=k_chan, V_CHAN=v_chan,
         SCALE=float(scale),
         num_warps=1,
     )

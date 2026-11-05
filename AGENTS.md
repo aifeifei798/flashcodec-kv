@@ -13,8 +13,9 @@ Read this whole file before making changes.
   this same-name layout. After `pip install -e .` it imports from anywhere.
 - Tests are plain runnable scripts (`assert` + `__main__` summary, function names
   are pytest-compatible): `python tests/test_jpeg.py`, `python tests/test_png.py`,
-  `python tests/test_causal.py`, `python tests/test_hf_integration.py`.
-  Run all four after touching codecs/cache.
+  `python tests/test_causal.py`, `python tests/test_hf_integration.py`,
+  `python tests/test_calibrated_bits.py`, `python tests/test_storage.py`.
+  Run all six after touching codecs/cache.
 - Benchmarks: `python benchmarks/bench_reconstruct.py` (PSNR/cosine),
   `python benchmarks/bench_vram.py [--cuda]` (storage occupancy/timings).
 - This directory is gitignored inside the host repo — it is an independent git
@@ -164,6 +165,57 @@ Read this whole file before making changes.
   19.36 at 50%. Per-layer damages are super-additive — truncation is a last
   resort, int8 is the default. Repro: `benchmarks/bench_adaptive.py`.
 
+## Channel profile and sub-byte packing (1.1)
+
+- **Scale model.** The archive stores one fp32 scale per (block, frequency) row,
+  shared by all head_dim channels. Per-channel magnitudes differ by orders of
+  magnitude, so a *static* calibrated profile `g[freq, d]` folded into the step
+  (`step = scale * g`) cuts the reconstruction error at 8 bits (measured
+  0.0224 -> 0.0059 on K, 0.0094 -> 0.0065 on V), and is what makes 7-bit
+  usable. The profile is per (layer, stream) — K and V
+  profiles differ enough that sharing one table is *worse* than no table on V.
+  `FlashCodecLayer` therefore builds two codec instances; do not "share them for
+  tidiness".
+- **Calibration is offline and causal.** `calibrate_channel_scales` runs one
+  forward on 1-2k tokens; the table is a training-time constant, never derived
+  from the stream being decoded (that would break the causal invariant).
+- **Measured ppl (Qwen3-0.6B dense, 16x512 windows built from the repo's
+  markdown, disjoint 2048-token calibration, baseline 31.1504)**: b8 31.6745
+  (+0.524) -> b8+profile 31.1210 (-0.029) -> b7+profile 31.1750 (+0.025) at
+  45.3% -> b6+profile 31.3993 (+0.249) at 39.1%. Without the profile b7 is
+  +2.34 and b6 +16.05, b4 collapses (ppl 11336). Hybrid Qwen3.5-0.8B (6/24
+  layers, baseline 23.5318): b6+profile -0.010. Repro:
+  `benchmarks/bench_calibrated.py`.
+- **Bit packing** is an MSB-first contiguous stream, zero-padded to a byte
+  boundary so any head_dim works (`archived_dim(D) = ceil(D*bits/8)`). The cache
+  stores uint8 with that last dim; `head_dim` must be tracked on the stream
+  (`_CodecStream.head_dim`) because `_coeffs.shape[-1]` is no longer D. The
+  Triton kernel unpacks with a gather (`(b0<<8|b1) >> (16-p0-bits)`), which is
+  ~2x the cost of the plain int8 load at 64K — acceptable, but do not expect it
+  to be free.
+- **`storage.py` is a storage/transport codec, not a hot-path one.** It expands
+  packed coefficients back to int8 first (bit-shifted streams compress worse),
+  concatenates a stream's parts and zlibs them. Loading re-packs; pass
+  `device="cuda"` (CPU packing is ~40 Mval/s, GPU ~100x faster).
+
+## Negative results (measured; do not re-propose without new data)
+
+- **2D DCT across heads is useless.** At an equal coefficient budget (16 of 64)
+  on real KV: keep all heads + 2 time freqs gives cos 0.970/0.815/0.768
+  (layer 0 K / 14 V / 27 V); keep all time freqs + 2 head freqs gives
+  0.826/0.524/0.524. The compressible energy is on the seq axis only. Any 2D
+  scheme that truncates the channel/head axis loses.
+- **Cosine is a mirage.** k=8 b=4 measures cos 0.994 and ppl 11336; k=8 b=6
+  measures cos 0.9986 and ppl 43.3. Judge every quantizer change by ppl, never
+  by cosine.
+- **Entropy coding cannot go on the hot path.** Symbol entropy at 8 bits is
+  6.84/8 (K 6.32, V 7.36) — ~15% of the payload — but decoding it every step
+  costs more than it saves, and Huffman/ANS is serial. Disk only.
+- **NVDEC / real-JPEG decode**: works (nvJPEG, 2.07 Gpix/s via torchvision) but
+  a decode step needs 56 images (28 layers x K,V), 0.55 s encode + 0.11 s decode
+  at 4K vs 3.6 ms for the Triton coefficient path (~183x), ~2200x at 64K. The
+  codec is not a JPEG bitstream and making it one does not pay.
+
 ## Design decisions (don't "refactor these away" in passing)
 
 - **The HF hot patch lives in the Cache layer, not the attention kernel**: KV
@@ -215,5 +267,7 @@ Read this whole file before making changes.
 - **1.x API is frozen**: `apply_flash_codec` / `remove_flash_codec`,
   `apply_codec_attention` / `remove_codec_attention`, `FlashCodecCache`,
   `FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
-  `codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`. Add options
-  with defaults; breaking changes need a 2.0.
+  `codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`,
+  `channel_scale` / `channel_scale_v`, `calibrate_channel_scales`,
+  `save_archive` / `load_archive`. Add options with defaults; breaking changes
+  need a 2.0.

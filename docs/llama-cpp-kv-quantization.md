@@ -178,6 +178,15 @@ argument rests on.
 
 ## 5. Where the transform does win: the same quantizer on coefficients
 
+> **v1.1 update.** The mismatch below — one fp32 scale per 128 coefficients vs
+> ggml's per-32 absmax — is addressed in the archive itself by the calibrated
+> channel profile (`JPEGCodec(channel_scale=...)`): a static
+> `(keep_freqs, head_dim)` table folded into the step, per layer and stream.
+> Measured effect at an identical byte count: up to ~4x lower reconstruction
+> error on K (~1.4x on V) at 8 bits, and a 7-bit archive that costs +0.025 ppl (vs +2.34 uncalibrated) on
+> Qwen3-0.6B. The analysis below is kept as-is because it isolates the *error
+> shaping* effect of the transform, which the profile does not change.
+
 §2–§4 tested flashcodec's *own* archive format, whose coefficient quantizer
 stores one fp32 scale per (block, frequency) row, i.e. one per 128 values. That
 is coarser than ggml's per-32 absmax. Feeding the same per-32 quantizer to the

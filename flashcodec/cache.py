@@ -37,19 +37,23 @@ except Exception:                          # fallback when transformers is absen
 
 
 def make_codec(mode="jpeg", block_size=8, keep_freqs=2, keep_ratio=1.0,
-               quant_bits=0):
+               quant_bits=0, channel_scale=None):
     """Build a codec instance from a mode name.
 
     ``quant_bits=8`` switches the jpeg archive to int8 coefficients with a
-    per-(block, frequency) scale (real byte-level saving); png ignores it (its
+    per-(block, frequency) scale (real byte-level saving); ``quant_bits < 8``
+    packs the coefficients into a bit stream. ``channel_scale`` is the
+    optional calibrated (keep_freqs, head_dim) profile. png ignores both (its
     lossless tier stores fp32 deltas on purpose)."""
     if mode == "jpeg":
         return JPEGCodec(block_size=block_size, keep_freqs=keep_freqs,
-                         quant_bits=quant_bits)
+                         quant_bits=quant_bits, channel_scale=channel_scale)
     if mode == "png":
         if quant_bits:
             raise ValueError("quant_bits is only supported for mode='jpeg' "
                              "(the png lossless tier must keep fp32 deltas)")
+        if channel_scale is not None:
+            raise ValueError("channel_scale is only supported for mode='jpeg'")
         return PNGCodec(block_size=block_size, keep_ratio=keep_ratio)
     raise ValueError(f"unknown mode: {mode!r} (expected 'jpeg' | 'png')")
 
@@ -75,6 +79,7 @@ class _CodecStream:
         self.n_archived = 0      # total number of archived tokens
         self.n_blocks = 0        # blocks used in the archive region
         self.meta = None         # (B, H, D, elem_size)
+        self.head_dim = None     # true D (the stored last dim is packed when bits<8)
         self.dtype = None        # stream input dtype (restored; SDPA dtype contract)
         self._capacity = 0       # blocks allocated in the archive (geometric growth)
         self._coeffs = None      # jpeg: (B,H,capacity,k,D)
@@ -96,7 +101,10 @@ class _CodecStream:
         if self.codec.name == "jpeg":
             k = self.codec.keep_freqs
             if self.codec.quantized:
-                return [("_coeffs", (B, H, cap, k, D), torch.int8),
+                packed = self.codec.packed
+                dim = self.codec.archived_dim(D) if packed else D
+                return [("_coeffs", (B, H, cap, k, dim),
+                         torch.uint8 if packed else torch.int8),
                         ("_scales", (B, H, cap, k, 1), torch.float32)]
             return [("_coeffs", (B, H, cap, k, D), self.dtype)]
         r = self.block_size
@@ -147,6 +155,7 @@ class _CodecStream:
         if self.meta is None:
             self.meta = (tokens.shape[0], tokens.shape[1], tokens.shape[-1],
                          tokens.element_size())
+            self.head_dim = tokens.shape[-1]
             self.dtype = tokens.dtype        # archive/read restore the input dtype
         buf = tokens if self.raw is None else torch.cat(
             [self.raw, tokens], dim=-2)
@@ -173,7 +182,7 @@ class _CodecStream:
             cap = max(b * r, self._rec_capacity * 2,
                       self._INITIAL_BLOCKS * r)
             new = torch.empty((like.shape[0], like.shape[1], cap,
-                               like.shape[-1]),
+                               self.head_dim),
                               dtype=self.dtype, device=like.device)
             if self._rec is not None and self._rec_blocks:
                 done = self._rec_blocks * r
@@ -183,7 +192,8 @@ class _CodecStream:
             rec = self.codec.decompress(
                 self._coeffs[:, :, a:b],
                 scales=(self._scales[:, :, a:b]
-                        if self.codec.quantized else None))
+                        if self.codec.quantized else None),
+                head_dim=self.head_dim)
             if rec.dtype != self.dtype:
                 rec = rec.to(self.dtype)
         else:
@@ -280,7 +290,7 @@ class _CodecStream:
                     0, idx)
                 self._rec = new_r
             return
-        B, H, D = idx.numel(), like.shape[1], like.shape[-1]
+        B, H, D = idx.numel(), like.shape[1], self.head_dim
         for attr, shape, dtype in self._archive_spec(self._capacity, B, H, D):
             old = getattr(self, attr)
             new = torch.empty(shape, dtype=dtype, device=like.device)
@@ -336,10 +346,15 @@ class CodecKVCache:
     """
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
-                 keep_ratio=1.0, quant_bits=0):
+                 keep_ratio=1.0, quant_bits=0, channel_scale=None,
+                 channel_scale_v=None):
         self.mode = mode
         self.codec = make_codec(mode, block_size, keep_freqs, keep_ratio,
-                                quant_bits=quant_bits)
+                                quant_bits=quant_bits,
+                                channel_scale=channel_scale)
+        self.value_codec = make_codec(mode, block_size, keep_freqs,
+                                      keep_ratio, quant_bits=quant_bits,
+                                      channel_scale=channel_scale_v)
         self._keys = {}
         self._values = {}
 
@@ -347,7 +362,8 @@ class CodecKVCache:
     def _stream(self, store, layer_idx):
         st = store.get(layer_idx)
         if st is None:
-            st = _CodecStream(self.codec)
+            st = _CodecStream(self.value_codec if store is self._values
+                              else self.codec)
             store[layer_idx] = st
         return st
 
@@ -451,14 +467,20 @@ class FlashCodecLayer(_HFDynamicLayer):
     layer, requiring zero model surgery."""
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
-                 keep_ratio=1.0, quant_bits=0):
+                 keep_ratio=1.0, quant_bits=0, channel_scale=None,
+                 channel_scale_v=None):
         super().__init__()
-        codec = make_codec(mode, block_size, keep_freqs, keep_ratio,
-                           quant_bits=quant_bits)
+        key_codec = make_codec(mode, block_size, keep_freqs, keep_ratio,
+                               quant_bits=quant_bits,
+                               channel_scale=channel_scale)
+        value_codec = make_codec(mode, block_size, keep_freqs, keep_ratio,
+                                 quant_bits=quant_bits,
+                                 channel_scale=channel_scale_v)
         self.mode = mode
-        self.codec = codec
-        self._key_stream = _CodecStream(codec)
-        self._value_stream = _CodecStream(codec)
+        self.codec = key_codec
+        self.value_codec = value_codec
+        self._key_stream = _CodecStream(key_codec)
+        self._value_stream = _CodecStream(value_codec)
 
     def lazy_initialization(self, key_states, value_states):
         self.dtype, self.device = key_states.dtype, key_states.device
@@ -560,7 +582,8 @@ class FlashCodecCache(_HFCache):
     """
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
-                 keep_ratio=1.0, quant_bits=0):
+                 keep_ratio=1.0, quant_bits=0, channel_scale=None,
+                 channel_scale_v=None):
         if not HAS_HF_CACHE:
             raise ImportError(
                 "FlashCodecCache requires transformers 5.x (this project only "
@@ -571,10 +594,13 @@ class FlashCodecCache(_HFCache):
             layer_class_to_replicate=partial(
                 FlashCodecLayer, mode=mode, block_size=block_size,
                 keep_freqs=keep_freqs, keep_ratio=keep_ratio,
-                quant_bits=quant_bits))
+                quant_bits=quant_bits, channel_scale=channel_scale,
+                channel_scale_v=channel_scale_v))
         self.mode = mode
         self.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
-                              keep_ratio=keep_ratio, quant_bits=quant_bits)
+                              keep_ratio=keep_ratio, quant_bits=quant_bits,
+                              channel_scale=channel_scale,
+                              channel_scale_v=channel_scale_v)
 
     @property
     def _seen_tokens(self):
@@ -584,7 +610,8 @@ class FlashCodecCache(_HFCache):
 
     @classmethod
     def from_config(cls, config, mode="jpeg", block_size=8, keep_freqs=2,
-                    keep_ratio=1.0, quant_bits=0, per_layer=None):
+                    keep_ratio=1.0, quant_bits=0, per_layer=None,
+                    channel_scale=None, channel_scale_v=None):
         """Build the mixed-layer list from the model config (Qwen3.5-style
         hybrid architectures): only full_attention layers get a codec layer,
         while the remaining layer types (linear_attention / sliding, etc.)
@@ -612,7 +639,9 @@ class FlashCodecCache(_HFCache):
             if ltype == "full_attention":
                 cfg = dict(mode=mode, block_size=block_size,
                            keep_freqs=keep_freqs, keep_ratio=keep_ratio,
-                           quant_bits=quant_bits)
+                           quant_bits=quant_bits,
+                           channel_scale=channel_scale,
+                           channel_scale_v=channel_scale_v)
                 cfg.update(per_layer.get(idx, {}))
                 layers.append(FlashCodecLayer(**cfg))
             else:
@@ -622,6 +651,8 @@ class FlashCodecCache(_HFCache):
         obj.mode = mode
         obj.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
                              keep_ratio=keep_ratio, quant_bits=quant_bits,
+                             channel_scale=channel_scale,
+                             channel_scale_v=channel_scale_v,
                              per_layer=per_layer)
         return obj
 

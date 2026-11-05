@@ -8,6 +8,55 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [1.1.0] - 2026-11-05
+
+### Added
+
+- **Calibrated channel profile** (`JPEGCodec(channel_scale=...)`,
+  `calibrate_channel_scales(model, input_ids)`): one static
+  `(keep_freqs, head_dim)` table per layer *and stream*, folded into the
+  quantizer step (`step = scale[block, freq] * profile[freq, d]`). The table is
+  a constant, so decode pays one broadcast multiply. Measured on Qwen3-0.6B
+  (16 x 512-token windows built from the repository's own markdown, profile
+  calibrated on a disjoint 2048-token slice, baseline ppl 31.1504):
+
+  | tier | ppl | dppl | of bf16 |
+  |---|---|---|---|
+  | k=8 b=8 | 31.6745 | +0.524 | 51.6% |
+  | k=8 b=8 + profile | 31.1210 | -0.029 | 51.6% |
+  | k=8 b=7 | 33.4916 | +2.341 | 45.3% |
+  | **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
+  | k=8 b=6 | 47.2046 | +16.05 | 39.1% |
+  | k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+
+  Hybrid Qwen3.5-0.8B (6/24 layers carry a codec, baseline 23.5318): b=7 +
+  profile +0.015, b=6 + profile -0.010. Without the profile, b=6/b=4 stay
+  catastrophic on the dense model (+16.05 / ppl 11336 for b=4).
+  Reproduce: `benchmarks/bench_calibrated.py`.
+- **Sub-byte coefficient packing** (`quant_bits` 2..8): contiguous MSB-first
+  bit stream, byte-padded so any head_dim works; unpacked on the fly by both
+  the torch path and the Triton split-K kernel (gather-based, no extra pass).
+- **`save_archive` / `load_archive`** (`flashcodec/storage.py`): the storage /
+  transport entropy coder. Packed coefficients are expanded back to int8 before
+  compression (bit-shifted streams compress worse), one zlib blob per stream,
+  zstd when importable. 28-layer Qwen3-0.6B, 4001 tokens, k=8 b=7 + profile:
+  208.0 MB in memory -> 181.6 MB on disk (76.7% of the logical payload, 39.6%
+  of the bf16 KV), bitwise round trip; save 5.0 s, load 13.2 s on CPU /
+  1.46 s with `device="cuda"`.
+- `tests/test_calibrated_bits.py` and `tests/test_storage.py` (both in CI).
+
+### Changed
+
+- `JPEGCodec.storage_ratio()` accounts for the bit depth.
+- `FlashCodecLayer` / `FlashCodecCache` / `CodecKVCache` accept `channel_scale`
+  and `channel_scale_v`; per-layer tables are passed through `per_layer=`.
+- `FlashCodecLayer` builds separate key/value codec instances (they are
+  stateless — this is what makes per-stream profiles possible without changing
+  the archive layout).
+- Decode cost at 64K (B=1, H_kv=8, H_q=16, D=128, k=8, per layer): b=8
+  0.371 ms, b=8 + profile 0.414 ms, b=7 + profile 0.767 ms (the gather unpack
+  is ~2x the plain int8 load; still far below the materialized path).
+
 ## [Unreleased]
 
 ### Documentation

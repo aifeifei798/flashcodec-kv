@@ -149,21 +149,77 @@ out = model.generate(input_ids, max_new_tokens=64)   # 自动注入 codec cache
 remove_flash_codec(model)                            # 还原系统默认 cache
 ```
 
-可用参数：`keep_freqs`（jpeg）、`keep_ratio`（png）、`quant_bits`（`0` 或 `8`）、
-`per_layer={idx: {...}}`（校准过的逐层预算）、`materialization_free=True`（见第 5 节）。
+可用参数：`keep_freqs`（jpeg）、`keep_ratio`（png）、`quant_bits`（`0` 或
+`2..8`，小于 8 时按位打包）、`channel_scale` / `channel_scale_v`（校准的通道
+profile）、`per_layer={idx: {...}}`（逐层配置）、`materialization_free=True`
+（见第 5 节）。
 
 ### 4. 档位怎么选
 
-| 目标 | 配置 | 存储（bf16 KV） | 代价 |
+| 目标 | 配置 | 存储（bf16 KV） | 代价（Qwen3-0.6B 实测） |
 |---|---|---|---|
 | 输出逐位一致 | `mode="png", keep_ratio=1.0` | ~1.9× | 只花存储（fp32 差分） |
-| **安全默认** | `mode="jpeg", keep_freqs=8, quant_bits=8` | ~52% | 稠密模型 +2% ppl；混合模型 token 100% 一致 |
-| 激进（压缩层数少时） | `keep_freqs=2` / `4` | 25–50% | 截断误差逐层累积 |
+| **推荐（带校准）** | `keep_freqs=8, quant_bits=7` + profile | **~45%** | +0.025 ppl |
+| 更省（带校准） | `keep_freqs=8, quant_bits=6` + profile | **~39%** | +0.249 ppl |
+| 无校准安全档 | `keep_freqs=8, quant_bits=8` | ~52% | +0.52 ppl |
+| 无校准 7-bit | `keep_freqs=8, quant_bits=7` | ~45% | +2.34 ppl |
+| 截断（挂 codec 的层少时） | `keep_freqs=2` / `4` | 25–50% | 稠密模型直接崩 |
 | 极限 | `keep_freqs=2, quant_bits=8` | ~13% | 稠密模型直接崩 |
 
-经验规则：`keep_freqs = block_size`（完整 DCT 基）+ `quant_bits=8` 是唯一在
-**每层**都稳的有损设置。`keep_freqs < block_size` 只在挂 codec 的层数很少
-（混合架构）时划算；逐档实测表见[基准](#基准实测b2-h8-s2048-d64随机游走自相关信号fp32)。
+经验规则：`keep_freqs = block_size`（完整 DCT 基）是前提；**降比特比截断频率划算**，
+但必须先做通道 profile 校准，否则 7-bit 以下会崩。混合架构（只有少数层挂 codec）
+对截断宽容得多，实测 k=4 甚至略好于基线。
+
+#### 4.1 校准通道 profile（做 7-bit 的前提）
+
+一行系数只有**一个** fp32 scale，却被 128 个通道共享；通道幅度差几个数量级，
+量化级大部分被少数“响”通道吃掉。`calibrate_channel_scales` 用一次前向（1–2k
+token）估一张静态 `(keep_freqs, head_dim)` 表，K/V 分开：
+
+```python
+from flashcodec import calibrate_channel_scales
+
+ids = tokenizer(calib_text, return_tensors="pt").input_ids.to("cuda")
+calib = calibrate_channel_scales(model, ids, keep_freqs=8)   # 一次前向
+apply_flash_codec(model, mode="jpeg", keep_freqs=8, quant_bits=7,
+                  per_layer=calib)
+```
+
+同一份 Qwen3-0.6B 实测（16×512 token；profile 用另外 2048 token 校准）：
+
+| 档位 | ppl | Δ | 存储 |
+|---|---|---|---|
+| baseline | 31.1504 | — | 100% |
+| k=8 b=8 | 31.6745 | +0.524 | 51.6% |
+| k=8 b=8 + profile | 31.1210 | −0.029 | 51.6% |
+| k=8 b=7 | 33.4916 | +2.341 | 45.3% |
+| **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
+| k=8 b=6 | 47.2046 | +16.05 | 39.1% |
+| k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+
+混合架构 Qwen3.5-0.8B（只有 6/24 层挂 codec，baseline 23.5318）：b=7 + profile
++0.015、b=6 + profile −0.010。复现：`python benchmarks/bench_calibrated.py`
+（默认用仓库自带 markdown 组窗口，校准切片与评测窗口不重叠）。
+
+profile 是 codec 常量，解码只多一次 broadcast 乘：64K、k=8 时 0.371 → 0.414
+ms/层；7-bit 的 gather 解包再翻一倍到 0.767 ms/层。`per_layer` 也可以只覆盖部分层。
+
+#### 4.2 存档：熵编码只用于落盘 / 传输
+
+热路径上 int8 系数直接给 attention 读，每步重新熵解码会亏；落盘时符号熵约
+6.8/8 bit，压缩是净赚。`save_archive` 把逻辑 int8 流 + scales + tail 一起压缩
+（装了 `zstandard` 就优先 zstd，否则 zlib）：
+
+```python
+from flashcodec import save_archive, load_archive
+
+stats = save_archive(cache, "ctx.fckv")   # {"raw_bytes","stored_bytes","ratio"}
+cache2 = load_archive("ctx.fckv", config=model.config, device="cuda")
+```
+
+28 层 Qwen3-0.6B、4001 token、k=8 b=7 + profile：内存 208.0 MB → 文件 181.6 MB
+（逻辑载荷的 76.7%、bf16 KV 的 39.6%），逐位还原；save 5.0 s，load CPU 13.2 s /
+`device="cuda"` 1.46 s（7-bit 重新打包在 GPU 上快约 100×）。
 
 ### 5. 免物化解码（不构建 KV 视图）
 
