@@ -87,6 +87,14 @@ placeholder package).
   ppl, K-only -0.078, both +0.003). README gains a matching "why not offload"
   section in both languages; no code or API change.
 
+### Changed
+
+- `export_model` / `load_pretrained`: `trust_remote_code` support, calibration
+  clamped to the model's `max_position_embeddings`, and a clear error when a
+  model exposes no KV-cache layers. `--inspect` now prints the storage ratio for
+  the bundle's actual `head_dim`. Verified on the hybrid Qwen3.5-0.8B (6/24
+  codec layers, 133 KB, token-identical generation).
+
 ### Documentation
 
 - `docs/llama-cpp-kv-quantization.md`: measured same-bytes comparison against

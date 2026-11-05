@@ -107,7 +107,7 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
                  block_size=8, calib_texts=None, calib_ids=None,
                  calib_tokens=2048, quantile=0.95, save_weights=False,
                  dtype=torch.bfloat16, device="cuda", overwrite=False,
-                 local_files_only=False):
+                 local_files_only=False, trust_remote_code=False):
     """Calibrate ``model_id_or_path`` and write a bundle to ``out_dir``.
 
     ``save_weights=True`` writes a self-contained directory (model +
@@ -127,13 +127,18 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
     tokenizer = None
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            model_id_or_path, local_files_only=local_files_only)
+            model_id_or_path, local_files_only=local_files_only,
+            trust_remote_code=trust_remote_code)
     except Exception:
         pass
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_path, local_files_only=local_files_only,
-        dtype=dtype).to(device).eval()
+        trust_remote_code=trust_remote_code, dtype=dtype).to(device).eval()
 
+    maxpos = getattr(model.config, "max_position_embeddings", None)
+    if maxpos and calib_tokens > int(maxpos):
+        print(f"clamping calibration to the model's {maxpos} positions")
+        calib_tokens = int(maxpos)
     texts = list(calib_texts) if calib_texts else [_BUILTIN_CALIB]
     if not calib_texts:
         print("no --calib-text: calibrating on a small builtin sample "
@@ -147,6 +152,11 @@ def export_model(model_id_or_path, out_dir, *, keep_freqs=8, quant_bits=7,
     scales = calibrate_channel_scales(model, calib_ids, block_size=block_size,
                                       keep_freqs=keep_freqs, quantile=quantile)
     print(f"  {len(scales)} layers in {time.time() - t0:.1f}s", flush=True)
+    if not scales:
+        raise RuntimeError(
+            f"{model_id_or_path} exposed no KV-cache layers to calibrate "
+            "(not a standard decoder-only CausalLM, or its cache is not a "
+            "transformers 5.x Cache with .layers)")
 
     manifest = {
         "format": "flashcodec-kv-model",
@@ -226,7 +236,8 @@ def apply_export(model, manifest, materialization_free=False):
 
 
 def load_pretrained(path, device=None, dtype=None, materialization_free=False,
-                    local_files_only=False, **model_kwargs):
+                    local_files_only=False, trust_remote_code=False,
+                    **model_kwargs):
     """Load an exported bundle (or plain model dir + sidecar) and patch it.
 
     Returns ``(model, tokenizer)`` — ``tokenizer`` is ``None`` when the bundle
@@ -246,13 +257,15 @@ def load_pretrained(path, device=None, dtype=None, materialization_free=False,
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(
-        base, local_files_only=local_files_only, dtype=dtype,
+        base, local_files_only=local_files_only,
+        trust_remote_code=trust_remote_code, dtype=dtype,
         **model_kwargs).to(device)
     model.eval()
     tokenizer = None
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            base, local_files_only=local_files_only)
+            base, local_files_only=local_files_only,
+            trust_remote_code=trust_remote_code)
     except Exception:
         pass
     apply_export(model, manifest, materialization_free=materialization_free)
@@ -277,9 +290,11 @@ def _inspect(path):
     sizes = sorted({tuple(e['channel_scale']['shape'])
                     for e in m['layers'].values() if 'channel_scale' in e})
     print(f"profiles : {sizes}")
-    bits = c['keep_freqs'], c['quant_bits']
-    print(f"storage  : ~{(c['keep_freqs']*128*c['quant_bits']/8 + c['keep_freqs']*4)/(8*128*2)*100:.1f}% "
-          f"of bf16 KV (one stream)")
+    k, b = c['keep_freqs'], c['quant_bits']
+    dims = [s[1] for s in sizes] or [128]
+    for D in dims:
+        print(f"storage  : ~{(k*D*b/8 + k*4)/(c['block_size']*D*2)*100:.1f}% "
+              f"of bf16 KV (head_dim={D}, one stream)")
 
 
 def main(argv=None):
@@ -307,6 +322,8 @@ def main(argv=None):
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--offline", action="store_true",
                     help="only use locally cached model files")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="needed by some custom architectures")
     args = ap.parse_args(argv)
 
     if args.inspect:

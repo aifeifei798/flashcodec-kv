@@ -317,6 +317,13 @@ profile → `generate` 直接生效。已经自己加载好模型的，用
 实测（Qwen3-0.6B，2048 token 校准）：bundle 313 KB / 28 层，7-bit 档 45.3%，
 同一 prompt 下生成结果与未压缩模型**逐 token 一致**。
 
+**兼容性**：任意 transformers 5.x 的 decoder-only CausalLM（Cache 带 `.layers`）。
+纯 dense 模型逐层校准；混合架构只校准 `full_attention` 层（实测 Qwen3.5-0.8B：
+6/24 层、bundle 133 KB、生成逐 token 一致）；滑动窗口层保持原生 cache，不挂 codec。
+没有 KV cache 的架构（Mamba / RWKV 等）会直接报错。自定义架构加
+`--trust-remote-code`；校准长度会自动截到模型的 `max_position_embeddings`。
+
+
 ## Transformers 集成（Qwen3.5-0.8B 实战验证）
 
 混合架构（如 Qwen3.5：18 层线性注意力 + 6 层全注意力）自动处理——

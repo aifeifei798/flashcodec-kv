@@ -354,6 +354,15 @@ Measured on Qwen3-0.6B with 2048 calibration tokens: 313 KB for 28 layers,
 45.3% of bf16 KV, and the generated tokens are identical to the uncompressed
 model on the same prompt.
 
+**Compatibility**: any decoder-only CausalLM on transformers 5.x whose cache is a
+`Cache` with `.layers`. Dense models calibrate every layer; hybrid architectures
+only calibrate the `full_attention` layers (measured on Qwen3.5-0.8B: 6/24
+layers, 133 KB bundle, token-identical generation); sliding-window layers keep
+the native cache and get no codec. Architectures without a KV cache
+(Mamba/RWKV) fail loudly. Custom architectures need `--trust-remote-code`, and
+the calibration length is clamped to the model's `max_position_embeddings`.
+
+
 ## Transformers integration (real-world tested on Qwen3.5-0.8B)
 
 Hybrid architectures (e.g. Qwen3.5: 18 linear-attention layers + 6
