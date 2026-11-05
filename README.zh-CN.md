@@ -519,6 +519,36 @@ top-1 97.3% vs 97.2%），双侧 4-bit 反而差 6%。不存在值得落地的�
 因此**不跟进 llama.cpp 实现**。完整表格、机理与复现：
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
 
+## 为什么不做 V offload / 视频流解码（实测）
+
+设想是：K 留在显存（高频、精确匹配），V 打包成 JPEG/AV1 丢到主机内存或硬盘，
+用到时用 NVDEC 异步解压，从而打破 HBM 墙。三个实测把这条路堵死了
+（`python benchmarks/bench_offload.py`；Qwen3-0.6B，RTX 5090 D，PCIe Gen4 x8，
+pinned H2D 实测 10.7 GB/s）：
+
+| 上下文 | decode 单步 | V（8-bit） | H2D 传输 | 传输/单步 | 与传输并行的单步 | NVDEC 每步解码 |
+|---|---|---|---|---|---|---|
+| 4K | 16.1 ms | 117 MB | 11.0 ms | 0.7× | 18.4 ms（1.1×） | 37.4 ms |
+| 16K | 16.1 ms | 470 MB | 44.0 ms | 2.7× | 47.3 ms（2.9×） | 149.6 ms |
+| 64K | 17.9 ms | 1879 MB | 176.1 ms | 9.8× | 177.4 ms（9.9×） | 598.3 ms |
+
+1. **单步 decode 是 launch-bound，几乎不随上下文变长**（4K→64K 只有 16→18 ms），
+   而 V 的传输量随 S 线性增长。传输/单步的比值**随上下文变长而恶化**，
+   不存在"越长越划算"的拐点。
+2. **瓶颈是 PCIe，不是 NVDEC**。每步用 NVDEC 解 V 是 10–33×；就算解码免费，
+   光把 1.88 GB 像素搬进显存也要 176 ms。最后一列只是解压本身，还没算码流传输。
+3. **"V 比 K 皮实"在 7-bit 下不成立**（`--kv-split`，同一套校准 profile）：
+   只压 V（K 无损）−0.050 ppl、只压 K（V 无损）−0.078、两者都压 +0.003；
+   6-bit 时只压 V +0.164、只压 K −0.022。K/V 不对称是 4-bit 的现象
+   （见 llama.cpp 对比一节），在可用档位上两条流一样便宜。
+
+所以：**≤4K 时 V offload 只贵 ~10%**（可接受，但省下的显存只有 235 MB）；
+**≥8K 就开始超过单步（16K 2.9×、64K 9.9×）**。真正该做的是把 V 也压到 7-bit 留在显存
+（45%，零 PCIe，+0.03 ppl），而不是搬到主机内存或视频流里。
+
+唯一说得通的用法：把 V 真正落到**磁盘**做冷启动 / 跨机迁移（`save_archive`），
+加载时后台解一次；不要把它放进每步的路径。
+
 ## 目录结构
 
 ```
@@ -528,10 +558,12 @@ flashcodec/
 │   ├── codecs/jpeg.py     # DCT-II 基底、投影/重构（纯 GEMM，无循环）
 │   ├── codecs/png.py      # Anchor + 一阶差分、cumsum 还原、Top-M 阈值滤波
 │   ├── cache.py           # CodecKVCache：raw 尾 + 倍增预分配归档，全量/增量双接口
+│   ├── calibrate.py       # 逐层/逐流通道 profile（一次前向）
+│   ├── storage.py         # save_archive / load_archive（zlib/zstd，落盘与传输）
 │   ├── attention.py       # 免物化解码 attention（系数域计算）
 │   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
-├── tests/                 # jpeg / png / causal / attention 四组测试（直接运行）
-├── benchmarks/            # 显存/存储 + PSNR/余弦 + 困惑度压测
+├── tests/                 # jpeg / png / causal / attention / 校准位深 / 存档 六组测试
+├── benchmarks/            # 显存/存储、PSNR/余弦、困惑度+校准、offload/NVDEC
 ├── docs/                  # 实测对比（vs llama.cpp KV 量化）
 ├── demo/                  # Gradio 左右对比 chat
 ├── images/                # README 截图
@@ -555,6 +587,10 @@ python tests/test_hf_integration.py # transformers 5.x 原生 generate 集成：
                                     # 对未打补丁模型的精确性 / 逐层预算
 python tests/test_attention.py      # 系数域解码 attention 与物化路径一致
                                     # （jpeg / int8 / png、GQA），且从不构建 KV 视图
+python tests/test_calibrated_bits.py # 2..8 bit 位打包往返、校准 profile 降低误差、
+                                    # 打包归档仍满足因果性、Triton == torch
+python tests/test_storage.py        # 存档逐位往返（CodecKVCache + FlashCodecCache）、
+                                    # 压缩后确实变小、多层归档必须带 config
 ```
 
 ## 稳定性（1.x）

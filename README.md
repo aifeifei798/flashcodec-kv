@@ -584,6 +584,43 @@ llama.cpp integration follows from this**. Full tables, mechanism and
 reproduction:
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 
+## Why not offload V to host / a video stream (measured)
+
+The proposal: keep K in VRAM (high-frequency, exact matching), pack V into a
+JPEG/AV1 stream on host RAM or disk, and decode it with NVDEC asynchronously —
+breaking the HBM wall. Three measurements close that path
+(`python benchmarks/bench_offload.py`; Qwen3-0.6B on an RTX 5090 D, PCIe Gen4
+x8, pinned H2D measured at 10.7 GB/s):
+
+| context | decode step | V (8-bit) | H2D | xfer/step | concurrent step | NVDEC/step |
+|---|---|---|---|---|---|---|---|
+| 4K | 16.1 ms | 117 MB | 11.0 ms | 0.7x | 18.4 ms (1.1x) | 37.4 ms |
+| 16K | 16.1 ms | 470 MB | 44.0 ms | 2.7x | 47.3 ms (2.9x) | 149.6 ms |
+| 64K | 17.9 ms | 1879 MB | 176.1 ms | 9.8x | 177.4 ms (9.9x) | 598.3 ms |
+
+1. **The decode step is launch-bound and barely grows with context**
+   (16 -> 18 ms from 4K to 64K), while the V volume grows linearly in S. So the
+   transfer/step ratio *gets worse* with longer contexts; there is no
+   "long context makes it worth it" crossover.
+2. **The wall is PCIe, not NVDEC.** Decoding V through NVDEC every step is
+   10-33x the step; and even if the decode were free, moving 1.88 GB of pixels
+   into VRAM costs 176 ms. The NVDEC column is the decode alone, before any
+   bitstream transfer.
+3. **"V is the tough one, K the sensitive one" does not hold at 7 bits**
+   (`--kv-split`, same calibrated profile): V-only -0.050 ppl, K-only -0.078,
+   both +0.003; at 6 bits V-only +0.164, K-only -0.022. The K/V asymmetry is a
+   4-bit phenomenon (see the llama.cpp section); at usable depths both streams
+   are equally cheap.
+
+So: **at <=4K, V offload costs ~10%** (acceptable, but it only saves 235 MB of
+VRAM); **from 8K it exceeds the step (2.9x at 16K, 9.9x at 64K)**. The right move is to keep V
+in VRAM at 7 bits (45%, zero PCIe, +0.03 ppl), not to move it to host memory or
+a video stream.
+
+The only defensible use: land V on **disk** for cold start / cross-machine
+transfer (`save_archive`) and decode once in the background — never on the
+per-step path.
+
 ## Repository layout
 
 ```
@@ -593,10 +630,12 @@ flashcodec/
 │   ├── codecs/jpeg.py     # DCT-II basis, project/reconstruct (pure GEMM, no loops)
 │   ├── codecs/png.py      # anchor + first-order delta, cumsum, Top-M filter
 │   ├── cache.py           # CodecKVCache: raw tail + capacity-doubled archives
+│   ├── calibrate.py       # per-layer/stream channel profile (one forward pass)
+│   ├── storage.py         # save_archive / load_archive (zlib/zstd, disk & transport)
 │   ├── attention.py       # materialization-free decode attention (coefficient domain)
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
-├── tests/                 # jpeg / png / causal / attention suites (standalone scripts)
-├── benchmarks/            # storage + PSNR/cosine + perplexity benchmarks
+├── tests/                 # jpeg / png / causal / attention / calibrated-bits / storage
+├── benchmarks/            # storage, PSNR/cosine, ppl+calibration, offload/NVDEC
 ├── docs/                  # measured comparisons (vs llama.cpp KV quantization)
 ├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots
@@ -620,6 +659,10 @@ python tests/test_hf_integration.py # native transformers 5.x generate: explicit
                                     # per-layer schedule
 python tests/test_attention.py      # coefficient-domain decode attention matches the materialized
                                     # path (jpeg / int8 / png, GQA); never builds the KV view
+python tests/test_calibrated_bits.py # bit-packing round trip (2..8 bits), calibrated profile lowers
+                                    # error, packed archives stay causal, Triton == torch
+python tests/test_storage.py        # save/load bitwise round trip (CodecKVCache + FlashCodecCache),
+                                    # compressed smaller than raw, multi-layer needs a config
 ```
 
 ## Stability (1.x)

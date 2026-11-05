@@ -59,6 +59,17 @@ placeholder package).
 
 ## [Unreleased]
 
+### Added
+
+- `benchmarks/bench_offload.py`: measures whether V can live on host RAM / a
+  video stream. Warm pinned H2D is 10.7 GB/s (Gen4 x8); the decode step is
+  launch-bound (16.1 -> 17.9 ms from 4K to 64K) while the V transfer grows
+  linearly (11.0 / 44.0 / 176.1 ms), so the best-case pipelined step is
+  1.1x / 2.9x / 9.9x, and NVDEC-per-step is 37 / 150 / 598 ms. `--kv-split`
+  also shows there is no K/V tolerance asymmetry at 7 bits (V-only -0.050
+  ppl, K-only -0.078, both +0.003). README gains a matching "why not offload"
+  section in both languages; no code or API change.
+
 ### Documentation
 
 - `docs/llama-cpp-kv-quantization.md`: measured same-bytes comparison against

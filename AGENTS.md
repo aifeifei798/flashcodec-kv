@@ -215,6 +215,14 @@ Read this whole file before making changes.
   a decode step needs 56 images (28 layers x K,V), 0.55 s encode + 0.11 s decode
   at 4K vs 3.6 ms for the Triton coefficient path (~183x), ~2200x at 64K. The
   codec is not a JPEG bitstream and making it one does not pay.
+- **V offload to host / "V as a video stream"**: dead on PCIe. Measured
+  (`benchmarks/bench_offload.py`, Gen4 x8, pinned H2D 10.7 GB/s): the decode
+  step is launch-bound (16.1 / 16.1 / 17.9 ms at 4K / 16K / 64K) while the V
+  transfer is linear (11.0 / 44.0 / 176.1 ms), so even a perfectly overlapped
+  copy gives 1.1x / 2.9x / 9.9x; NVDEC per step is 37 / 150 / 598 ms. There is
+  no crossover at longer contexts — the ratio is scale-invariant. Also, "V is
+  the tolerant stream" is a 4-bit phenomenon: at 7 bits V-only -0.050 ppl,
+  K-only -0.078, both +0.003. Keep V compressed in VRAM.
 
 ## Design decisions (don't "refactor these away" in passing)
 
