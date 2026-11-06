@@ -76,7 +76,8 @@ placeholder package).
 - `benchmarks/bench_mla.py`: flashcodec on an MLA model, measured on the real
   DeepSeek-V2-Lite checkpoint (cache = 512-d latent + 64-d rope key per
   token/layer, 27 layers). 7-bit + profile is 44.4% of the bf16 latent cache,
-  ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), generated tokens identical.
+  ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142 at 38.2%, 5-bit 15.2964 at
+  31.9%; 4-bit breaks at +0.902 / 25.7%), generated tokens identical.
   Decode step at 4K: 1.00 s raw vs 1.03 s compressed, because `expand_kv`
   materializes the per-head keys/values on every forward regardless.
 - `export_model` / `load_pretrained` take `device_map` / `max_memory`, and the

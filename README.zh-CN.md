@@ -332,7 +332,8 @@ profile → `generate` 直接生效。已经自己加载好模型的，用
 （`kv_lora_rank` 压缩键 + 共享 RoPE 键，V2-Lite 是 576 维），flashcodec 压的正是
 这个张量，所以 MLA 不用改就能用。在真实 DeepSeek-V2-Lite 权重上实测
 （`benchmarks/bench_mla.py`，27 层）：7-bit + profile 占 bf16 latent cache 的
-44.4%，ppl 15.2497 → 15.2369（6-bit + profile 15.3142），生成逐 token 一致。
+44.4%，ppl 15.2497 → 15.2369（6-bit + profile 15.3142）；5-bit 是 31.9%、
++0.05，4-bit 才崩（25.7%、+0.90）。生成逐 token 一致。
 两个注意点：MLA latent 本身已经比 GQA cache 小约 7 倍（16 头 × 128 维时每 token
 每层 576 vs 4096 个元素），而 transformers 的 `expand_kv` 每次前向都会把每头
 K/V 重新展开，所以缩小的只是**存储的 cache** —— 4K 上下文解码单步实测

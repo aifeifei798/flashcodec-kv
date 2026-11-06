@@ -373,8 +373,9 @@ the calibration length is clamped to the model's `max_position_embeddings`.
 V2-Lite) — instead of per-head K/V, and flashcodec compresses exactly that
 tensor, so MLA works unchanged. Measured on the real DeepSeek-V2-Lite
 checkpoint (`benchmarks/bench_mla.py`, 27 layers): 7-bit + profile is 44.4% of
-the bf16 latent cache, ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), and the
-generated tokens are identical. Two caveats: the MLA latent is already ~7x
+the bf16 latent cache, ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142, 5-bit
+31.9% at +0.05), and the generated tokens are identical; 4-bit is where it
+breaks (25.7%, +0.90). Two caveats: the MLA latent is already ~7x
 smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128),
 and transformers' `expand_kv` rebuilds the per-head keys/values on every
 forward, so only the *stored* cache shrinks — the 4K decode step measured

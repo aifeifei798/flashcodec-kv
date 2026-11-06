@@ -144,6 +144,10 @@ def main():
              ("k=8 b=7 +profile", dict(mode="jpeg", keep_freqs=8, quant_bits=7,
                                        per_layer=calib)),
              ("k=8 b=6 +profile", dict(mode="jpeg", keep_freqs=8, quant_bits=6,
+                                       per_layer=calib)),
+             ("k=8 b=5 +profile", dict(mode="jpeg", keep_freqs=8, quant_bits=5,
+                                       per_layer=calib)),
+             ("k=8 b=4 +profile", dict(mode="jpeg", keep_freqs=8, quant_bits=4,
                                        per_layer=calib))]
     raw = SEQ * n_layers * (k_dim + v_dim) * 2          # one window, bf16
     print(f"{'tier':<18} {'ppl':>9} {'dppl':>9} {'storage':>10} {'ratio':>7}")

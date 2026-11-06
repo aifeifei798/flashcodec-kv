@@ -220,8 +220,9 @@ Read this whole file before making changes.
   per-head K/V from the reconstructed latent afterwards.
 - Measured (`benchmarks/bench_mla.py`, 27 layers, 8 x 512 windows): 7-bit +
   profile 44.4% of the bf16 latent, ppl 15.2497 -> 15.2369; 6-bit + profile
-  15.3142; generated tokens identical. 4K decode step 1004 ms raw vs 1035 ms
-  compressed.
+  15.3142 (+0.065) at 38.2%; 5-bit 15.2964 (+0.047) at 31.9%; 4-bit breaks
+  (16.1518, +0.902) at 25.7%; generated tokens identical. 4K decode step
+  1004 ms raw vs 1035 ms compressed.
 - **Do not sell this as a large memory win**: the MLA latent is already ~7x
   smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128)
   and HF materializes the expanded keys/values every forward, so only the stored
