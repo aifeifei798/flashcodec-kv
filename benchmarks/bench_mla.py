@@ -98,8 +98,12 @@ def main():
 
     # ---- corpus -------------------------------------------------------------
     order = ["README.zh-CN.md", "README.md", "AGENTS.md", "CHANGELOG.md"]
-    texts = [(ROOT / n).read_text(encoding="utf-8") for n in order
-             if (ROOT / n).exists()]
+    frozen = ROOT / "docs" / "eval-corpus.txt"
+    if frozen.exists():                    # frozen so doc edits do not move ppl
+        texts = [frozen.read_text(encoding="utf-8")]
+    else:
+        texts = [(ROOT / n).read_text(encoding="utf-8") for n in order
+                 if (ROOT / n).exists()]
     ids = []
     for t in texts:
         ids.extend(tok(t, add_special_tokens=False).input_ids)

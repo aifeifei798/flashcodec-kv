@@ -6,11 +6,13 @@ channels; calibrating a per-(frequency, channel) table is what makes 7-bit
 (and, more marginally, 6-bit) usable at all. The numbers below are the ones in
 the README.
 
-Corpus: by default the repository's own markdown (README.zh-CN.md, README.md,
-AGENTS.md, CHANGELOG.md, docs/*.md) is concatenated into windows, so the run is
-self-contained and reproducible. Set FLASHCODEC_CORPUS to a JSONL file with a
-"text" field to use your own data (the calibration slice is taken after the
-evaluated windows, so it never overlaps them).
+Corpus: by default the frozen `docs/eval-corpus.txt` (a snapshot of the
+repository's own markdown: README.zh-CN.md, README.md, AGENTS.md, CHANGELOG.md,
+docs/*.md). It is frozen on purpose — building the windows from the live docs
+would make every README edit move the measured numbers. Set
+FLASHCODEC_CORPUS to a JSONL file with a "text" field to use your own data (the
+calibration slice is taken after the evaluated windows, so it never overlaps
+them).
 
 Usage:
     python benchmarks/bench_calibrated.py
@@ -50,6 +52,7 @@ model = AutoModelForCausalLM.from_pretrained(
     dtype=torch.bfloat16 if device == "cuda" else torch.float32).to(device).eval()
 
 corpus = os.environ.get("FLASHCODEC_CORPUS")
+frozen = ROOT / "docs" / "eval-corpus.txt"
 if corpus:
     texts = []
     with open(corpus, encoding="utf-8") as fh:
@@ -58,6 +61,8 @@ if corpus:
                 texts.append(json.loads(line).get("text", ""))
             except json.JSONDecodeError:
                 pass
+elif frozen.exists():
+    texts = [frozen.read_text(encoding="utf-8")]
 else:
     order = ["README.zh-CN.md", "README.md", "AGENTS.md", "CHANGELOG.md"]
     paths = [ROOT / n for n in order] + sorted((ROOT / "docs").glob("*.md"))

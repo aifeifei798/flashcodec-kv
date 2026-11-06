@@ -57,7 +57,7 @@ placeholder package).
   0.371 ms, b=8 + profile 0.414 ms, b=7 + profile 0.767 ms (the gather unpack
   is ~2x the plain int8 load; still far below the materialized path).
 
-## [1.2.0] - 2026-11-05
+## [1.2.0] - 2026-11-06
 
 ### Added
 
@@ -73,16 +73,11 @@ placeholder package).
   model on the same prompt.
 - `tests/test_export.py` (CI): manifest round trip, profile reload, patched
   generation, storage ratio.
-
-## [Unreleased]
-
-### Added
-
 - `benchmarks/bench_mla.py`: flashcodec on an MLA model, measured on the real
   DeepSeek-V2-Lite checkpoint (cache = 512-d latent + 64-d rope key per
   token/layer, 27 layers). 7-bit + profile is 44.4% of the bf16 latent cache,
   ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), generated tokens identical.
-  Decode step at 4K: 954 ms raw vs 959 ms compressed, because `expand_kv`
+  Decode step at 4K: 1.00 s raw vs 1.03 s compressed, because `expand_kv`
   materializes the per-head keys/values on every forward regardless.
 - `export_model` / `load_pretrained` take `device_map` / `max_memory`, and the
   CLI gains `--device-map auto` / `--max-gpu-gib`, so 16B-class checkpoints can
@@ -106,6 +101,15 @@ placeholder package).
 
 ### Documentation
 
+- **Benchmark corpus is frozen** (`docs/eval-corpus.txt`): `bench_calibrated.py`
+  and `bench_mla.py` used to build their windows from the live repository
+  markdown, so editing any doc moved the measured perplexity. They now read the
+  frozen snapshot (the calibration slice still never overlaps the eval windows),
+  and the calibrated tables in both READMEs / `AGENTS.md` were re-measured on it
+  (Qwen3-0.6B baseline 35.8389, 7-bit + profile +0.200; hybrid Qwen3.5-0.8B
+  baseline 27.1271, 7-bit + profile -0.006, 6-bit + profile +0.037; MLA
+  DeepSeek-V2-Lite unchanged at 15.2497 -> 15.2369). The numbers in the 1.1.0
+  entry below are the pre-freeze run and are kept as the historical record.
 - `docs/llama-cpp-kv-quantization.md`: measured same-bytes comparison against
   llama.cpp's KV quantization on Qwen3-0.6B (llama.cpp `184f65360`). Verdict:
   `-ctk q8_0` is ~free at 53% of fp16 bytes, while both usable flashcodec tiers

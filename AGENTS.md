@@ -179,12 +179,12 @@ Read this whole file before making changes.
 - **Calibration is offline and causal.** `calibrate_channel_scales` runs one
   forward on 1-2k tokens; the table is a training-time constant, never derived
   from the stream being decoded (that would break the causal invariant).
-- **Measured ppl (Qwen3-0.6B dense, 16x512 windows built from the repo's
-  markdown, disjoint 2048-token calibration, baseline 31.1504)**: b8 31.6745
-  (+0.524) -> b8+profile 31.1210 (-0.029) -> b7+profile 31.1750 (+0.025) at
-  45.3% -> b6+profile 31.3993 (+0.249) at 39.1%. Without the profile b7 is
-  +2.34 and b6 +16.05, b4 collapses (ppl 11336). Hybrid Qwen3.5-0.8B (6/24
-  layers, baseline 23.5318): b6+profile -0.010. Repro:
+- **Measured ppl (Qwen3-0.6B dense, 16x512 windows from the frozen
+  `docs/eval-corpus.txt`, disjoint 2048-token calibration, baseline 35.8389)**:
+  b8 36.1957 (+0.357) -> b8+profile 35.8191 (-0.020) -> b7+profile 36.0390
+  (+0.200) at 45.3% -> b6+profile 36.0494 (+0.211) at 39.1%. Without the
+  profile b7 is +2.64 and b6 +18.74. Hybrid Qwen3.5-0.8B (6/24 layers, baseline
+  27.1271): b7+profile -0.006, b6+profile +0.037. Repro:
   `benchmarks/bench_calibrated.py`.
 - **Bit packing** is an MSB-first contiguous stream, zero-padded to a byte
   boundary so any head_dim works (`archived_dim(D) = ceil(D*bits/8)`). The cache
@@ -220,7 +220,7 @@ Read this whole file before making changes.
   per-head K/V from the reconstructed latent afterwards.
 - Measured (`benchmarks/bench_mla.py`, 27 layers, 8 x 512 windows): 7-bit +
   profile 44.4% of the bf16 latent, ppl 15.2497 -> 15.2369; 6-bit + profile
-  15.3142; generated tokens identical. 4K decode step 954 ms raw vs 959 ms
+  15.3142; generated tokens identical. 4K decode step 1004 ms raw vs 1035 ms
   compressed.
 - **Do not sell this as a large memory win**: the MLA latent is already ~7x
   smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128)

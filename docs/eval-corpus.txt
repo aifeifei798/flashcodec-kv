@@ -1,0 +1,2640 @@
+# flashcodec
+
+> 把 Transformer 的时序 KV Cache 张量当作**高维多媒体图像信号**来压缩。
+
+[![PyPI](https://img.shields.io/pypi/v/flashcodec-kv.svg)](https://pypi.org/project/flashcodec-kv/)
+[![CI](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml)
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+传统 LLM 研究把隐空间张量视为孤立标量因子；flashcodec 认为 `(B, H, S, D)`
+布局里的 **seq 轴是一幅高维图像的行/列**——相邻 token 隐向量自相关、能量集中
+在低频、差分后方差收缩（具体程度取决于模型/层/张量：真实 KV 实测统计与逐层
+注意事项见「基准」一节）。于是数字多媒体领域的两大经典压缩理论可以
+直接迁移：
+
+| 模式 | 灵感 | 变换 | 性质 | 存储 |
+|---|---|---|---|---|
+| `mode="jpeg"` | JPEG | 分块正交 1D DCT-II，保留最低 K 个低频系数 | **有损频域** | `K/r`（4×~8× 显存节省） |
+| `mode="png"` | PNG | 块首锚点（I-Token）+ 一阶差分 Δ，Top-M 裁剪 | **无损/近无损时域** | 稠密等大；残差稀疏性留给熵编码 |
+
+`quant_bits=8`（仅 jpeg）把系数存成 int8 + 每个（块, 频率）一个 scale——在
+`K/r` 之上再省真实字节：**k=2 时只占原始 KV 的 6.6%（15×），PSNR 46.9 dB**，
+而 fp32 系数是 25% / 47.2 dB。
+
+数学形式（块长 r，操作轴 dim=-2）：
+
+- **JPEG**：$X_{\text{blk}} \in \mathbb{R}^{r \times D}$，$C = M_{\text{enc}} X_{\text{blk}}$，
+  $M_{\text{enc}} \in \mathbb{R}^{K \times r}$，$M[j,n] = c_j \cos\frac{\pi}{r}(n+\tfrac12)j$，
+  行正交归一（$K=r$ 时逐块无损）；重构 $\hat X = M_{\text{enc}}^\top C$。
+- **PNG**：$\Delta_i = x_i - x_{i-1}$（$i \ge 1$），$x_0$ 为全精度锚点；
+  重建 $\hat x_i = x_0 + \sum_{j=1}^{i} \Delta_j$（`cumsum`，纯线性、autograd 可微）。
+  相邻隐向量自相关 ⇒ $\mathrm{Var}(\Delta)/\mathrm{Var}(X) \approx 0.03$（**30× 方差压缩**，
+  实测），Top-M 裁剪后残差近零稀疏。
+
+```
+                    ┌────────────────────────────────────────────┐
+  (B,H,S,D) ──append──▶  raw_buffer（未满 r 的尾部，原始高保真）  │
+                    │        │ 满 r 个 token，批量归档（一次 GEMM │
+                    │        ▼  原地切片写入）                    │
+                    │  compressed_storage（倍增预分配）           │
+                    │   jpeg: 系数 (B,H,capacity,K,D)             │
+                    │   png:  deltas (B,H,capacity,r-1,D)         │
+                    │        + anchors (B,H,capacity,D)           │
+                    └───────────────┬────────────────────────────┘
+                                    │ read()：有效区解码 + raw 尾
+                                    ▼
+                            重构 KV 视图 (B,H,S,D)
+```
+
+归档存放在**单块几何倍增缓冲区**里（std::vector 式：初始 16 块，装满翻倍）。
+每满块只做一次原地切片写入（无反复重新分配）；`read()` 只解码**新增归档块**
+（每个新块一次批量 GEMM / cumsum，落在追加式重构缓存里），不再每个 decode step
+重解全部历史。若改成逐块碎片归档 + 逐归档循环解压，S=4096 的逐步解码
+read 会因 kernel launch 开销慢约 170×（实测 31ms → 0.18ms）。
+
+## 研究结论（2026-10）：与 llama.cpp KV 量化对比的负结果
+
+我们试过把它从"存储原型"推进成 llama.cpp 的 KV 缓存替代品：沿 seq 轴做 DCT，
+替换或叠加 llama.cpp 自带的行级 KV 量化（`-ctk/-ctv`）。四个模型（Qwen3-0.6B、
+Hy-MT2-1.8B、Gemma4-E2B、纯密集 Qwen3-8B），同字节，指标是 **mean KL +
+top-1 一致率**（实测发现微调模型上 ppl 是校准产物，而且它和 KL 对"K/V 谁更敏感"
+给出相反答案）：
+
+| 方案 | 8-bit 预算 | 4-bit 预算 |
+|---|---|---|
+| 截断（`k < r`） | — | 同等损伤下字节是 `q4_0` 的 2.7×；`k=2` 不可用 |
+| 无损基 + 逐频 int8 | 损伤是 `q8_0` 的 8× | 13% 字节，不可用 |
+| DCT 系数 + ggml 每 32 值 scale | 0.6B 上 KL 低 3×，1.8B/E2B/8B 持平 | 0.6B 上 KL 低 2.3×（仍然崩），其余 6–170% **更差** |
+| codec 叠加在 `q8_0` 之上 | 少 0.8% 字节，多 63% 损伤 | — |
+
+在真正重要的工况——`q8_0` K + `q4_0` V，占 fp16 KV 的 40.6%——Qwen3-8B 上这个
+变换是**无效操作**（K 走 DCT 的 KL 0.0045 vs 原始 0.0047，top-1 97.2% vs 97.3%），
+而"把 4 bit 花在 V 上而不是 K 上"的价值约为它的 10×。
+
+**结论：没有在 llama.cpp 里实现，也不建议实现。** seq 轴变换只在行量化已经把
+模型毁掉的区间才占优；凡量化本身可接受的工况，它都是持平或更差。留下来的价值
+是机理层面的：变换把量化误差搬进位置间缓变子空间（L2 误差相同，ppl 损伤少 3–6×），
+以及"KV 损伤取决于架构暴露面与 K/V 不对称，而不只取决于规模"。完整表格、
+机理与复现见 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
+
+## 因果安全设计
+
+只归档**完整块**；当前未满块永远留在 `raw_buffer`（原始精度）。增量解码时
+任意时刻的未来扰动都不会改写已归档张量（测试逐位验证）。`mode="png",
+keep_ratio=1.0` 的无损档位下，逐步解码注意力与全量前向注意力对齐 ≤1e-4。
+
+## 安装
+
+```bash
+pip install flashcodec-kv            # 核心：torch>=2.0
+pip install "flashcodec-kv[hf]"      # + transformers 5.x 后端
+pip install "flashcodec-kv[demo]"    # + gradio/matplotlib（demo 用）
+pip install -e ".[hf]"               # 或从源码安装
+```
+
+PyPI 分发包名：`flashcodec-kv`，导入名仍是 `flashcodec`（PyPI 上的
+`flashcodec` 是无关占位包，别装错）。
+
+## 用法
+
+### 1. 独立使用 codec cache（不需要 transformers）
+
+```python
+import torch
+from flashcodec import CodecKVCache
+
+cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2, quant_bits=8)
+k_hat, v_hat = cache.forward(k_seq, v_seq)   # 预填：(B,H,S,D) -> 重构视图
+k1, v1 = cache.decode_step(k_new, v_new)     # 追加一个 token（别名 update）
+print(cache.stats(0))        # tokens / archived / raw / storage_bytes / raw_bytes
+print(cache.storage_bytes()) # 所有层的 archive + raw 尾
+```
+
+`forward` 会先重置该层再整体填充；`decode_step` 追加并在满块时归档。
+要逐位无损档位就换 `mode="png", keep_ratio=1.0`。`crop(-n)` 删除尾部 token
+（负数，遵循 HF 约定），`reorder_cache(beam_idx)` 做 beam search 的批维重排，
+`reset()` 保留已分配容量。
+
+### 2. transformers 5.x：显式传 cache
+
+```python
+from flashcodec import FlashCodecCache
+
+cache = FlashCodecCache.from_config(
+    model.config, mode="jpeg", block_size=8,
+    keep_freqs=8,      # k = r：完整 DCT 基（变换本身无损）
+    quant_bits=8)      # int8 系数 -> 约 bf16 KV 的 52%
+out = model.generate(input_ids, max_new_tokens=64,
+                     past_key_values=cache, use_cache=True)
+
+print(cache.get_seq_length())        # prompt + new_tokens - 1
+print(cache.storage_bytes())         # codec 层：archive + raw 尾
+print(cache.codec_layer_indices())   # 例如 [3, 7, 11, 15, 19, 23]
+```
+
+`from_config` 只给 `full_attention` 层挂 codec，所以混合架构（Qwen3.5 式的
+线性注意力 + 全注意力）里的线性层保持原生；纯 decoder-only 模型则每层都压缩。
+`FlashCodecCache` 就是普通的 `transformers.cache_utils.Cache` 子类（5.x layer
+API），`update` / `get_seq_length` / `crop` / `reorder_cache` 与原生 cache 同语义。
+
+### 3. 一行热补丁
+
+```python
+from flashcodec import apply_flash_codec, remove_flash_codec
+
+apply_flash_codec(model, mode="jpeg", block_size=8,
+                  keep_freqs=8, quant_bits=8)
+out = model.generate(input_ids, max_new_tokens=64)   # 自动注入 codec cache
+remove_flash_codec(model)                            # 还原系统默认 cache
+```
+
+可用参数：`keep_freqs`（jpeg）、`keep_ratio`（png）、`quant_bits`（`0` 或
+`2..8`，小于 8 时按位打包）、`channel_scale` / `channel_scale_v`（校准的通道
+profile）、`per_layer={idx: {...}}`（逐层配置）、`materialization_free=True`
+（见第 5 节）。
+
+### 4. 档位怎么选
+
+| 目标 | 配置 | 存储（bf16 KV） | 代价（Qwen3-0.6B 实测） |
+|---|---|---|---|
+| 输出逐位一致 | `mode="png", keep_ratio=1.0` | ~1.9× | 只花存储（fp32 差分） |
+| **推荐（带校准）** | `keep_freqs=8, quant_bits=7` + profile | **~45%** | +0.025 ppl |
+| 更省（带校准） | `keep_freqs=8, quant_bits=6` + profile | **~39%** | +0.249 ppl |
+| 无校准安全档 | `keep_freqs=8, quant_bits=8` | ~52% | +0.52 ppl |
+| 无校准 7-bit | `keep_freqs=8, quant_bits=7` | ~45% | +2.34 ppl |
+| 截断（挂 codec 的层少时） | `keep_freqs=2` / `4` | 25–50% | 稠密模型直接崩 |
+| 极限 | `keep_freqs=2, quant_bits=8` | ~13% | 稠密模型直接崩 |
+
+经验规则：`keep_freqs = block_size`（完整 DCT 基）是前提；**降比特比截断频率划算**，
+但必须先做通道 profile 校准，否则 7-bit 以下会崩。混合架构（只有少数层挂 codec）
+对截断宽容得多，实测 k=4 甚至略好于基线。
+
+#### 4.1 校准通道 profile（做 7-bit 的前提）
+
+一行系数只有**一个** fp32 scale，却被 128 个通道共享；通道幅度差几个数量级，
+量化级大部分被少数“响”通道吃掉。`calibrate_channel_scales` 用一次前向（1–2k
+token）估一张静态 `(keep_freqs, head_dim)` 表，K/V 分开：
+
+```python
+from flashcodec import calibrate_channel_scales
+
+ids = tokenizer(calib_text, return_tensors="pt").input_ids.to("cuda")
+calib = calibrate_channel_scales(model, ids, keep_freqs=8)   # 一次前向
+apply_flash_codec(model, mode="jpeg", keep_freqs=8, quant_bits=7,
+                  per_layer=calib)
+```
+
+同一份 Qwen3-0.6B 实测（16×512 token；profile 用另外 2048 token 校准）：
+
+| 档位 | ppl | Δ | 存储 |
+|---|---|---|---|
+| baseline | 31.1504 | — | 100% |
+| k=8 b=8 | 31.6745 | +0.524 | 51.6% |
+| k=8 b=8 + profile | 31.1210 | −0.029 | 51.6% |
+| k=8 b=7 | 33.4916 | +2.341 | 45.3% |
+| **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
+| k=8 b=6 | 47.2046 | +16.05 | 39.1% |
+| k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+
+混合架构 Qwen3.5-0.8B（只有 6/24 层挂 codec，baseline 23.5318）：b=7 + profile
++0.015、b=6 + profile −0.010。复现：`python benchmarks/bench_calibrated.py`
+（默认用仓库自带 markdown 组窗口，校准切片与评测窗口不重叠）。
+
+profile 是 codec 常量，解码只多一次 broadcast 乘：64K、k=8 时 0.371 → 0.414
+ms/层；7-bit 的 gather 解包再翻一倍到 0.767 ms/层。`per_layer` 也可以只覆盖部分层。
+
+#### 4.2 存档：熵编码只用于落盘 / 传输
+
+热路径上 int8 系数直接给 attention 读，每步重新熵解码会亏；落盘时符号熵约
+6.8/8 bit，压缩是净赚。`save_archive` 把逻辑 int8 流 + scales + tail 一起压缩
+（装了 `zstandard` 就优先 zstd，否则 zlib）：
+
+```python
+from flashcodec import save_archive, load_archive
+
+stats = save_archive(cache, "ctx.fckv")   # {"raw_bytes","stored_bytes","ratio"}
+cache2 = load_archive("ctx.fckv", config=model.config, device="cuda")
+```
+
+28 层 Qwen3-0.6B、4001 token、k=8 b=7 + profile：内存 208.0 MB → 文件 181.6 MB
+（逻辑载荷的 76.7%、bf16 KV 的 39.6%），逐位还原；save 5.0 s，load CPU 13.2 s /
+`device="cuda"` 1.46 s（7-bit 重新打包在 GPU 上快约 100×）。
+
+### 5. 免物化解码（不构建 KV 视图）
+
+```python
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=8,
+                  quant_bits=8, materialization_free=True)
+out = model.generate(input_ids, max_new_tokens=64)
+
+from flashcodec import codec_attention_stats
+print(codec_attention_stats(model))   # 被包装的 attention 模块数（0 = 未启用）
+```
+
+decode step 直接用 Triton split-K kernel 在存储行上算 attention，并且释放
+prefill 的重构视图，稳态显存只剩归档。该 patch 有守卫（单 token、batch=1、
+eval、非滑窗、标准 `position_embeddings`），不满足会静默回退。
+
+### 6. 诊断
+
+| 调用 | 返回 |
+|---|---|
+| `cache.stats(layer)` | `tokens / archived / raw / storage_bytes / raw_bytes` |
+| `cache.storage_bytes(layer=None)` | archive + raw 尾字节数（不含倍增预留容量与重构视图） |
+| `cache.codec_layer_indices()` | 真正挂 codec 的层 |
+| `codec_attention_stats(model)` | 被包装的 attention 模块数（`0` = 未启用） |
+| `HAS_HF_CACHE` | transformers 后端是否可导入 |
+
+### 7. Codec 级 API（不经过 cache）
+
+```python
+from flashcodec import JPEGCodec, PNGCodec
+
+codec = JPEGCodec(block_size=8, keep_freqs=2, quant_bits=8)
+coeffs = codec.compress(k_seq)              # (..., n_blocks, k, D)
+q, scale = codec.quantize(coeffs)           # int8 + 每（块, 频率）scale
+k_hat = codec.decompress(q, scales=scale)   # (..., S, D)，输入 dtype
+
+png = PNGCodec(block_size=8, keep_ratio=1.0)
+delta, anchor = png.filter(k_seq)
+k_hat = png.reconstruct(delta, anchor)
+```
+
+张量契约：`(B, H, S, D)`，压缩轴 `dim=-2`。函数式 API（`dct_compress`、
+`dct_decompress`、`quantize_coeffs`、`dequantize_coeffs`、`png_filter`、
+`png_reconstruct`、`dct_basis`）同样导出。
+
+### 8. 常见坑
+
+- `pip install flashcodec-kv`，但 `import flashcodec` —— PyPI 名是分发包名，不是模块名。
+- 从源码目录运行时，`import flashcodec` 必须解析到包目录而不是同名项目目录
+  （`pip install -e .`，或进到项目目录里运行）。
+- `crop` 收**负数**（`cache.crop(-4)` 删掉尾部 4 个 token）。
+- beam search 各档都能用，但只有 `png keep_ratio=1.0` 与未打补丁模型逐位一致。
+- `materialization_free=True` 只支持 decode 且 batch=1；批量/padding 推理会自动回退。
+- `quant_bits` 只对 jpeg 有效（png 无损档必须保留 fp32 差分）。
+
+### 9. 导出成 7-bit 模型（校准 bundle）
+
+flashcodec 压的是**推理时的 KV cache**，不重量化模型权重（权重仍是 bf16）。
+"导出 7-bit 模型" = 原权重 + 一份 `flashcodec-kv.json` 侧车，里面是量化档位和
+逐层、逐流（K/V）的通道 profile：
+
+```bash
+python -m flashcodec.export Qwen/Qwen3-0.6B ./qwen3-0.6b-fckv \
+    --calib-text calibration.txt          # 加 --save-weights 打成自包含目录
+python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
+
+# 单卡放不下的模型（需要 accelerate）：
+python -m flashcodec.export deepseek-ai/DeepSeek-V2-Lite ./dsv2-lite-fckv \
+    --calib-text calibration.txt --device-map auto   # 默认按空闲显存的 80% 规划
+```
+
+```text
+format   : flashcodec-kv-model v1
+base     : Qwen/Qwen3-0.6B  (weights referenced)
+codec    : jpeg block=8 keep_freqs=8 quant_bits=7
+calib    : 2048 tokens, q0.95
+layers   : 28
+profiles : [(8, 128)]
+storage  : ~45.3% of bf16 KV (one stream)
+```
+
+加载（`flashcodec-export` 是同一个命令的 console script）：
+
+```python
+from flashcodec import load_pretrained
+
+model, tok = load_pretrained("./qwen3-0.6b-fckv")
+inputs = tok("Explain KV cache compression in one sentence.",
+             return_tensors="pt").to(model.device)
+out = model.generate(**inputs, max_new_tokens=128)
+print(model._flashcodec["caches"][0].storage_bytes())   # 实际归档占用
+```
+
+`load_pretrained` 依次完成：加载权重 → `apply_flash_codec` 套上 7-bit 档和逐层
+profile → `generate` 直接生效。已经自己加载好模型的，用
+`apply_export(model, read_manifest(path))`；要重做成别的档位，改 `--quant-bits`
+重新导出即可（profile 与档位无关，可复用）。
+
+实测（Qwen3-0.6B，2048 token 校准）：bundle 313 KB / 28 层，7-bit 档 45.3%，
+同一 prompt 下生成结果与未压缩模型**逐 token 一致**。
+
+**兼容性**：任意 transformers 5.x 的 decoder-only CausalLM（Cache 带 `.layers`）。
+纯 dense 模型逐层校准；混合架构只校准 `full_attention` 层（实测 Qwen3.5-0.8B：
+6/24 层、bundle 133 KB、生成逐 token 一致）；滑动窗口层保持原生 cache，不挂 codec。
+没有 KV cache 的架构（Mamba / RWKV 等）会直接报错。自定义架构加
+`--trust-remote-code`；校准长度会自动截到模型的 `max_position_embeddings`。
+
+**MLA（DeepSeek-V2/V3）**：cache 里存的不是每头 K/V，而是每 token 每层一份 latent
+（`kv_lora_rank` 压缩键 + 共享 RoPE 键，V2-Lite 是 576 维），flashcodec 压的正是
+这个张量，所以 MLA 不用改就能用。在真实 DeepSeek-V2-Lite 权重上实测
+（`benchmarks/bench_mla.py`，27 层）：7-bit + profile 占 bf16 latent cache 的
+44.4%，ppl 15.2497 → 15.2369（6-bit + profile 15.3142），生成逐 token 一致。
+两个注意点：MLA latent 本身已经比 GQA cache 小约 7 倍（16 头 × 128 维时每 token
+每层 576 vs 4096 个元素），而 transformers 的 `expand_kv` 每次前向都会把每头
+K/V 重新展开，所以缩小的只是**存储的 cache** —— 4K 上下文解码单步实测
+954 ms（原始）vs 959 ms（带 codec）。模型单卡放不下时用
+`--device-map auto` 导出（需要 `accelerate`；默认按空闲显存的 80% + 主机内存规划，
+`--max-gpu-gib` 可覆盖显存那一项）。
+
+
+## Transformers 集成（Qwen3.5-0.8B 实战验证）
+
+混合架构（如 Qwen3.5：18 层线性注意力 + 6 层全注意力）自动处理——
+`FlashCodecCache.from_config(model.config)` **只给 `full_attention` 层挂
+codec 层**，其余层类型保留原生动态层（递归/卷积状态不受影响）。
+`apply_flash_codec` 在拿到模型 config 时自动走 `from_config`。
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from flashcodec import apply_flash_codec
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B",
+                                             torch_dtype="bfloat16").cuda()
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+ids = tok("杭州的西湖", return_tensors="pt").input_ids.cuda()
+
+# 一行搞定——之后每次 generate() 都走编解码缓存
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2)
+out = model.generate(ids, max_new_tokens=48, do_sample=False)
+```
+
+Qwen3.5-0.8B 实测（bf16、CUDA、48 个贪心 token，`benchmarks/run_qwen_demo.py`）：
+
+| 档位 | 存储 vs raw KV | 输出 | 结论 |
+|---|---|---|---|
+| `png keep=1.0` | ~1.8×（fp32 差分换精确）| **生成 token 与未打补丁模型逐位一致** | 100% 保真基线 |
+| `jpeg k=8 int8` | **55.5%**（约 1.8×）| 文本流畅，**token 一致率 100%** | 安全有损档 |
+| `jpeg k=2` | **32.3%**（约 3.1×）| 文本流畅，token 一致率 38.1% | 有损档 |
+| `jpeg k=4` | 54.8%（约 1.8×）| 文本流畅，token 一致率 49.2% | 有损档 |
+| `jpeg k=2 int8` | **21.1%**（约 4.7×）| 文本流畅，token 一致率 38.1% | 有损 + int8 |
+
+混合层审计：`codec_layers=6/24`（仅全注意力层），零警告。复跑：
+`python benchmarks/run_qwen_demo.py`（离线加载；支持 `FLASHCODEC_MODEL` /
+`FLASHCODEC_NEW_TOKENS` 环境变量）。
+
+dtype 契约（详见 `AGENTS.md`）：PNG 差分恒为 fp32（bf16 差分会破坏无损
+档承诺的逐位精确性）；JPEG 系数与 `read()` 视图保持流输入 dtype
+（SDPA 要求 q/k/v 同 dtype）。
+
+## 免物化解码 attention
+
+这里的编解码沿 seq 轴都是**线性映射**：一个块的 r 个 token 满足
+`K_block = A @ S`，其中 `S` 是存储行（DCT 系数，或 anchor + 差分），`A` 是合成
+矩阵。于是解码查询可以直接在 `S` 上算：
+
+```
+q · K[p] = (q · S^T) @ A[p]        out = (prob @ A) @ S
+```
+
+`codec_decode_attention(q, key_stream, value_stream)` 实现单 token 版本（jpeg
+k<r、jpeg int8、png，含 GQA 分组）。`(S, D)` 的重构视图从不出现，结果与物化
+路径差 ≤1e-6。
+
+实测（`benchmarks/bench_attention.py`，B=1, H_kv=8, H_q=16, D=64, fp32）：
+
+| seq | 模式 | 物化路径 | 系数域路径 |
+|---|---|---|---|
+| 16384 | jpeg k=2 int8 | 0.20ms / 130MB | 0.30ms / **32MB** |
+| 65536 | jpeg k=2 int8 | 0.86ms / 520MB | **0.46ms / 128MB** |
+| 65536 | png keep=1.0 | 0.87ms / 520MB | 1.03ms / 272MB |
+
+适用范围：**仅解码**（prefill 仍走物化视图——系数形式会让 score 张量爆炸）。
+png 每块存 r 行，数值上支持但省不了内存；收益来自 jpeg `k < r`。
+
+**Triton split-K kernel**（`flashcodec/triton_attention.py`，flash-decoding 式：
+按块分片写 partial max/sum/acc，再由 combine kernel 合并）去掉了中间张量和
+launch 开销。单层、B=1、H_kv=8、H_q=16、D=128、`jpeg k=2 int8`
+（`benchmarks/bench_attention.py --cuda`）：
+
+| seq | 物化 | 系数域（torch） | 系数域（Triton） |
+|---|---|---|---|
+| 16384 | 0.20ms / 130MB | 0.29ms / 24MB | **0.09ms / 0MB** |
+| 65536 | 0.86ms / 520MB | 0.41ms / 96MB | **0.16ms / 0MB** |
+
+`apply_flash_codec(model, ..., materialization_free=True)` 已把它接进
+transformers：包装标准 Llama/Qwen 风格 attention 模块的 forward（投影 + RoPE
+不变，只替换 attention 输出），带单 token / batch=1 / eval / 非滑窗的守卫，
+不满足条件自动回退原路径；prefill 的重构视图在第一个 decode step 释放。
+`remove_flash_codec` 完整还原。
+
+端到端（`benchmarks/bench_e2e.py`，Qwen3-0.6B，4096 token prompt + 32 token）：
+
+| 档位 | tok/s | peak | steady |
+|---|---|---|---|
+| baseline（原始 KV） | 52.1 | 581MB | 0MB |
+| codec k=2 int8（物化） | 44.2 | 1545MB | 1535MB |
+| codec k=2 int8（免物化，Triton） | 40.3 | **642MB** | **122MB** |
+
+**稳态显存 1/12.6**，解码只比物化路径慢约 9%（4096 token 下每 step：22.8ms vs
+物化 21.7ms，原始 17.8ms）。剩余差距来自逐层的 split/combine 两次 launch，
+persistent kernel 可以再吃掉。
+
+## Demo（Qwen3.5-0.8B 左右对比 Chat）
+
+![flashcodec Gradio 左右对比 demo](images/demo.png)
+
+同一 prompt 两栏并排：左侧原生 KV Cache，右侧 flashcodec（五档：png 无损 /
+jpeg k=8 int8 / k=4 / k=2 / k=2 int8），带「免物化解码」开关（系数域 +
+Triton），每轮统计 KV 占用（归档 vs 物化视图）、峰值/稳态显存、每 token 延迟
+与 token 一致率。
+
+**Full comparison** 标签页会在同一 prompt 上跑 baseline + 所有档位，逐档给出：
+KV 占用对比原始、归档/视图拆分、decode tok/s、峰值/稳态显存、续写部分的
+teacher-forced NLL（困惑度式质量指标）与 token 一致率，并画存储/速度/NLL 三张柱状图。
+
+```bash
+pip install -e ".[demo]"   # gradio + matplotlib
+python demo/qwen_gradio_chat.py    # Gradio 左右对比 + 节约柱状图
+```
+
+## 基准（实测，B=2 H=8 S=2048 D=64，随机游走自相关信号，fp32）
+
+### 重构质量（`benchmarks/bench_reconstruct.py`）
+
+| 配置 | PSNR (dB) | cosine | 存储比 |
+|---|---|---|---|
+| jpeg r=8 k=1（8×） | 42.95 | 0.99943 | 12.5% |
+| jpeg r=8 k=2（4×） | 47.22 | 0.99985 | 25.0% |
+| jpeg r=8 k=4（2×） | 51.66 | 1.00001 | 50.0% |
+| jpeg r=8 k=2 int8 | 46.92 | 0.99983 | 6.6% |
+| jpeg r=8 k=4 int8 | 50.89 | 0.99999 | 13.3% |
+| png r=8 keep=0.5 | 50.11 | 0.99997 | 100%（稀疏留熵编码）|
+| png r=8 keep=1.0 | ~196（fp 舍入级）| 1.00000 | 100% |
+
+### 真实 KV 统计（真实模型，512 token）
+
+`bench_reconstruct` 用的是合成随机游走；真实 cache 没那么光滑。在真实
+post-RoPE KV 上实测（沿 seq 轴的 `Var(Δ)/Var(X)`，以及块长 8 时最低 k=2 个
+DCT 系数保留的块能量占比）：
+
+| 模型 / 层 | 张量 | Var(Δ)/Var(X) | k=2 保留能量 |
+|---|---|---|---|
+| Qwen3-0.6B L0 | K | 0.16 | 0.94 |
+| Qwen3-0.6B L0 | V | 1.87 | 0.31 |
+| Qwen3-0.6B L27 | V | 1.02 | 0.59 |
+| Qwen3.5-0.8B L3 | K | 0.72 | 0.71 |
+| Qwen3.5-0.8B L23 | V | 0.09 | 0.97 |
+
+V 经常是**反**相关的（比值 > 1），所以「一阶差分让方差塌缩」是光滑合成信号
+的性质，不是每一层真实 KV 的性质。实际结论：系数截断（`k < r`）必须按层决策
+——稠密模型（28 层全压）会误差累积到崩，那里请用 `k = r` + `quant_bits=8`。
+
+### 困惑度（`benchmarks/bench_ppl.py`；16 × 512 token，bf16，本地语料）
+
+| 档位 | Qwen3.5-0.8B（压 6/24 层） | Qwen3-0.6B（压 28/28 层） | 存储 |
+|---|---|---|---|
+| baseline | 22.4803 | 16.7931 | 100% |
+| png keep=1.0 | 22.4803 (+0.000) | 16.7931 (+0.000) | 188% |
+| jpeg k=8（无损基） | 22.4877 (+0.007) | 16.8058 (+0.013) | 100% |
+| **jpeg k=8 int8** | **22.4991 (+0.019)** | **17.1348 (+0.34)** | **~52%** |
+| jpeg k=4 | 22.3010 (−0.18) | 470.85 (+454) | 50% |
+| jpeg k=2 | 24.0566 (+1.58) | 6485.5 (+6469) | 25% |
+| jpeg k=2 int8 | 24.0590 (+1.58) | 8118.5 (+8102) | 13% |
+
+混合架构结果好是因为只有 6/24 层挂了 codec（18 层线性注意力保留原生状态）；
+稠密模型那两列说明了为什么按层截断不能盲用。
+
+### 逐层预算（`benchmarks/bench_adaptive.py`，Qwen3-0.6B，6 × 512 token）
+
+校准方式：每次只把一层降到 k=4，测困惑度损伤；然后给损伤最小的那一半层
+k=4、其余保持 k=r（75% 存储）：
+
+| 方案 | ppl | Δppl | 存储 |
+|---|---|---|---|
+| baseline (k=r) | 18.9786 | — | 100% |
+| 均匀 k=6 | 48.0531 | +29.07 | 75% |
+| 自适应（14 层 k=4） | 40.8309 | +21.85 | 75% |
+| 均匀 k=4 | 710.22 | +691.24 | 50% |
+| 均匀 k=r int8 | 19.3627 | +0.38 | 50% |
+
+同样存储下校准比均匀分配好 15%，但损伤是**超线性叠加**的（最便宜的 14 层
+单独每个不超过 +0.5，合起来 +22），而 int8 在 50% 存储下好得多。所以把逐层
+截断当最后手段；确实需要时用 `per_layer={idx: {"keep_freqs": ...}}`。
+
+### 缓存占用与耗时（`benchmarks/bench_vram.py`，CPU）
+
+| seq | 模式 | storage | 原始比 | fill | read |
+|---|---|---|---|---|---|
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 6.7ms | 0.0ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 34.3ms | 0.5ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 141.9ms | 3.1ms |
+| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 9.2ms | 0.0ms |
+| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 46.0ms | 0.3ms |
+| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 197.9ms | 3.1ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 243.3ms | 3.3ms |
+
+CPU 计时逐次波动约 ±20%（取 3 次最小）；storage/ratio 两列是精确值。
+`read` 为「物化视图并真实读取（`.sum()`）」的耗时，即消费端成本而非仅 kernel
+启动。解码按归档块记忆化，`read` 只在**新增块**上做一次解码，不再每个 decode
+step 重解全部历史（此前最后两行为 38.7ms / 71.9ms）。
+
+PNG 模式不省稠密存储（无损基线的宿命）——它的价值在 30× 方差压缩 + Top-M
+近零稀疏残差，是熵编码器的理想输入（本库不内置熵编码）。
+
+## 与 llama.cpp KV 量化的同字节对比
+
+llama.cpp 自带行级 KV 量化（`-ctk/-ctv`），所以公平的问题不是「codec 能不能压」，
+而是「同样的字节预算下能不能赢过它」。同模型实测（Qwen3-0.6B、wikitext、
+llama.cpp `184f65360`、CUDA + FA）：
+
+| KV 配置 | ppl | Δ vs fp16 | 占 fp16 字节 |
+|---|---|---|---|
+| `-ctk f16 -ctv f16` | 19.6037 | — | 100% |
+| `-ctk q8_0 -ctv q8_0` | 19.6138 | +0.05% | 53.1% |
+| `-ctk q8_0 -ctv q4_0` | 19.6579 | +0.28% | 40.6% |
+| `-ctk q4_0 -ctv q4_0` | 65.8321 | +236% | 28.1% |
+
+对着这条线，flashcodec **当前归档格式**在同字节下没有优势：
+
+- **截断（`k < r`）**：K 上 `jpeg k=4`（75% 的 fp16 K 字节）与全量 `q4_0`
+  （28% 的 fp16 KV 字节）损伤相同 —— 同等损伤多用 2.7× 字节；密集模型上 `k=2` 不可用。
+- **无损基 + `quant_bits=8`**（约 50% fp16 字节）：b32/k32 配置 +0.38% ppl，
+  而 `q8_0` 是 +0.05% —— 同预算下损伤差 8×。
+- **叠在 llama.cpp 量化之上也没有收益**：在 `q8_0` 之上 codec 只能再榨出 0.8%
+  字节（每 128 个值一个 scale，而非每 32 个一个），代价是损伤 +63%；在 `q4_0`
+  之上，int8 系数归档比它替换掉的 4-bit 载荷**更大**（39.8% vs 28.1%）。
+
+**输的是系数量化粒度，不是变换本身。** 给系数用与 ggml 相同的每 32 值 absmax
+（无损基、字节数完全相同），排序就反过来：**8-bit 下困惑度损伤少 5×、4-bit 下少 7×**，
+而重构误差**一模一样** —— 变换只是把量化误差挪到位置间缓变（低频）子空间，
+softmax 几乎看不见（误差整形，不是更好的 K）。该结果在 HF 侧测得，仍需在
+llama.cpp 内确认；它也不能让本模型的 4-bit K 变得可用（ppl 41.6 vs 18.6）。
+
+实测还显示 K 与 V 不对称：4-bit **K** 是唯一的悬崖（只压 K 到 `q4_0` → +237%），
+4-bit V 几乎免费（+0.29%）。所以生产上便宜的配置是 `-ctk q8_0 -ctv q4_0`。
+但这个悬崖是**小模型特性**：27B 混合架构（`qwen35`，17 个带 KV 的层）上
+`q4_0` KV 在 8k 上下文只 +0.39%、32k 只 +0.20%，生产规模模型没有这个字节
+预算问题需要解决。
+
+**稠密中等模型是唯一"4-bit KV 有代价但不崩"的区间**，也是唯一 ppl 失效的区间。
+Gemma4-12B（48 层，40 SWA + 8 全局 MQA）用 `--kl-divergence` 测得：8-bit KL
+0.17、4-bit KL 0.30、top-1 一致率 89%（同一协议下 27B 混合只有 0.0035）。
+它的 ppl 随语料在 2.2–355 之间漂移，量化还常常让 ppl *变好*，所以那一档
+只能用 KL。
+
+**随后的 HF 侧 KL 预判把这最后一个方向也关掉了**：同字节下，变换只在行量化
+已经造成破坏时有效（Qwen3-0.6B：8-bit KL 低 3×，4-bit 低 2.3× 但仍然崩），
+在 Hy-MT2-1.8B 和 Gemma4-E2B 上则是 8-bit 持平、4-bit 略差；而在**普通稠密
+Qwen3-8B**（对 codec 最有利的架构）上，真正重要的工况完全没变化
+（`q8_0` K + `q4_0` V、40.6% 字节：KL 0.0047 vs 加 DCT 的 0.0045，
+top-1 97.3% vs 97.2%），双侧 4-bit 反而差 6%。不存在值得落地的工况，
+因此**不跟进 llama.cpp 实现**。完整表格、机理与复现：
+[`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
+
+## 为什么不做 V offload / 视频流解码（实测）
+
+设想是：K 留在显存（高频、精确匹配），V 打包成 JPEG/AV1 丢到主机内存或硬盘，
+用到时用 NVDEC 异步解压，从而打破 HBM 墙。三个实测把这条路堵死了
+（`python benchmarks/bench_offload.py`；Qwen3-0.6B，RTX 5090 D，PCIe Gen4 x8，
+pinned H2D 实测 10.7 GB/s）：
+
+| 上下文 | decode 单步 | V（8-bit） | H2D 传输 | 传输/单步 | 与传输并行的单步 | NVDEC 每步解码 |
+|---|---|---|---|---|---|---|
+| 4K | 16.1 ms | 117 MB | 11.0 ms | 0.7× | 18.4 ms（1.1×） | 37.4 ms |
+| 16K | 16.1 ms | 470 MB | 44.0 ms | 2.7× | 47.3 ms（2.9×） | 149.6 ms |
+| 64K | 17.9 ms | 1879 MB | 176.1 ms | 9.8× | 177.4 ms（9.9×） | 598.3 ms |
+
+1. **单步 decode 是 launch-bound，几乎不随上下文变长**（4K→64K 只有 16→18 ms），
+   而 V 的传输量随 S 线性增长。传输/单步的比值**随上下文变长而恶化**，
+   不存在"越长越划算"的拐点。
+2. **瓶颈是 PCIe，不是 NVDEC**。每步用 NVDEC 解 V 是 10–33×；就算解码免费，
+   光把 1.88 GB 像素搬进显存也要 176 ms。最后一列只是解压本身，还没算码流传输。
+3. **"V 比 K 皮实"在 7-bit 下不成立**（`--kv-split`，同一套校准 profile）：
+   只压 V（K 无损）−0.050 ppl、只压 K（V 无损）−0.078、两者都压 +0.003；
+   6-bit 时只压 V +0.164、只压 K −0.022。K/V 不对称是 4-bit 的现象
+   （见 llama.cpp 对比一节），在可用档位上两条流一样便宜。
+
+所以：**≤4K 时 V offload 只贵 ~10%**（可接受，但省下的显存只有 235 MB）；
+**≥8K 就开始超过单步（16K 2.9×、64K 9.9×）**。真正该做的是把 V 也压到 7-bit 留在显存
+（45%，零 PCIe，+0.03 ppl），而不是搬到主机内存或视频流里。
+
+唯一说得通的用法：把 V 真正落到**磁盘**做冷启动 / 跨机迁移（`save_archive`），
+加载时后台解一次；不要把它放进每步的路径。
+
+## 目录结构
+
+```
+flashcodec/
+├── flashcodec/
+│   ├── __init__.py        # apply_flash_codec / CodecKVCache / JPEGCodec / PNGCodec
+│   ├── codecs/jpeg.py     # DCT-II 基底、投影/重构（纯 GEMM，无循环）
+│   ├── codecs/png.py      # Anchor + 一阶差分、cumsum 还原、Top-M 阈值滤波
+│   ├── cache.py           # CodecKVCache：raw 尾 + 倍增预分配归档，全量/增量双接口
+│   ├── calibrate.py       # 逐层/逐流通道 profile（一次前向）
+│   ├── storage.py         # save_archive / load_archive（zlib/zstd，落盘与传输）
+│   ├── export.py          # export_model / load_pretrained（7-bit 校准 bundle）
+│   ├── attention.py       # 免物化解码 attention（系数域计算）
+│   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
+├── tests/                 # jpeg / png / causal / attention / 校准位深 / 存档 / 导出 七组测试
+├── benchmarks/            # 显存/存储、PSNR/余弦、困惑度+校准、offload/NVDEC、MLA
+├── docs/                  # 实测对比（vs llama.cpp KV 量化）
+├── demo/                  # Gradio 左右对比 chat
+├── images/                # README 截图
+├── .github/workflows/     # CI：CPU 测试 + transformers 集成
+├── CHANGELOG.md
+├── pyproject.toml
+└── README.md
+```
+
+## 测试
+
+```bash
+python tests/test_jpeg.py           # 正交归一、K=r 无损、k=2 余弦>0.99、K 单调
+python tests/test_png.py            # 无损 maxdiff<1e-6、方差压缩比打印、可微
+python tests/test_causal.py         # 未来扰动零泄露、增量 vs 全量 ≤1e-4、
+                                    # 记忆化 read 与全量解码逐位一致、crop 精确且可重复、
+                                    # beam search 批维重排
+python tests/test_hf_integration.py # transformers 5.x 原生 generate 集成：
+                                    # 显式缓存 / 热补丁 / PNG 无损逐 token 一致 /
+                                    # 70 token 跨 8+ 块稳定性 / beam search 与 crop
+                                    # 对未打补丁模型的精确性 / 逐层预算
+python tests/test_attention.py      # 系数域解码 attention 与物化路径一致
+                                    # （jpeg / int8 / png、GQA），且从不构建 KV 视图
+python tests/test_calibrated_bits.py # 2..8 bit 位打包往返、校准 profile 降低误差、
+                                    # 打包归档仍满足因果性、Triton == torch
+python tests/test_storage.py        # 存档逐位往返（CodecKVCache + FlashCodecCache）、
+                                    # 压缩后确实变小、多层归档必须带 config
+python tests/test_export.py         # manifest 往返、profile 重载、patched 生成、占用比
+```
+
+## 稳定性（1.x）
+
+1.x 期间公开 API 冻结：`apply_flash_codec` / `remove_flash_codec`、
+`apply_codec_attention` / `remove_codec_attention`、`FlashCodecCache`、
+`FlashCodecLayer`、`CodecKVCache`、`JPEGCodec`、`PNGCodec`、
+`codec_decode_attention`、`make_codec`，以及 `quant_bits` / `per_layer` 选项。
+新功能只做增量参数；既有签名默认值不变。下面的边界清单依然成立——这是一个
+接口稳定的研究库，不等于生产就绪承诺。
+
+## 边界与说明（诚实清单）
+
+- 研究原型：`read()` 物化完整重构视图参与注意力，显存收益在**缓存存储层**
+  （如上表）；与 flash-attention 类不物化内核结合才能量化端到端收益。该视图
+  被记忆化并跨 decode step 复用，因此稳态显存 = 归档 + 一份原始 KV 大小的视图。
+- 全量 `forward(seq)` 预填会把完整块直接压缩，块内位置的注意力会看到块级
+  重构（块内近似）；增量 `decode_step` 路径无此问题（当前块恒为 raw）。
+- 压缩张量为稠密布局；PNG 的 Top-M 稀疏性尚未接熵编码器（实测只做稀疏打包
+  基本是白忙：fp32 差分本身占大头，bf16 输入下甚至可能比原始更大——得先做
+  差分量化）。
+- 系数截断（`k < r`）必须按层决策：稠密模型每层都压会误差累积（实测
+  Qwen3-0.6B 困惑度 16.8 → 6486 @ k=2）。这种模型请用 `k = r` +
+  `quant_bits=8`（约 52% 存储，+2% ppl）；激进压缩比留给混合架构（只有
+  full_attention 层挂 codec 的情形）。
+- **不是 llama.cpp KV 量化的更优替代 —— 至少不是当前归档格式**：同字节下
+  `q8_0` 赢过两个可用档位（截断；以及无损基 + int8，+0.05% vs +0.38% ppl）；
+  4-bit V 几乎免费，4-bit K 是唯一悬崖。但**变换本身**是另一回事：把系数交给
+  ggml 式的每 32 值 absmax 后，8-bit / 4-bit 分别赢 5× / 7×，且重构误差不变
+  —— 该结果在 HF 侧测得，尚未在 llama.cpp 内确认。详见
+  [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
+- 与 [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
+  中 v4.2 原型（模型内 KV 复用层的 DCT/差分读取）同源：那里是"每位置视图"
+  语义，这里是标准 cache 存储语义。
+
+## License
+
+MIT
+
+
+# flashcodec
+
+> Compressing Transformer KV Cache tensors as **high-dimensional multimedia image signals**.
+
+[![PyPI](https://img.shields.io/pypi/v/flashcodec-kv.svg)](https://pypi.org/project/flashcodec-kv/)
+[![CI](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml)
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+Conventional LLM research treats hidden-space tensors as isolated scalar
+factors. flashcodec observes that the seq axis of a `(B, H, S, D)` KV tensor
+behaves like the rows/columns of a high-dimensional image — adjacent token
+representations are autocorrelated, energy concentrates in low frequencies, and
+first-order differences shrink in variance (how strongly depends on the model,
+layer and tensor: the measured real-KV statistics and the per-layer caveat are
+in the Benchmarks section). Two classic
+multimedia compression theories therefore transfer directly:
+
+| Mode | Inspired by | Transform | Nature | Storage |
+|---|---|---|---|---|
+| `mode="jpeg"` | JPEG | Block-wise orthonormal 1D DCT-II, keep lowest K coeffs | **Lossy, frequency domain** | `K/r` (4×–8× less memory) |
+| `mode="png"` | PNG | Per-block anchor (I-Token) + first-order deltas, Top-M pruning | **Lossless / near-lossless, time domain** | Dense, size-neutral; sparsity left to entropy coding |
+
+`quant_bits=8` (jpeg only) stores the coefficients as int8 with a
+per-(block, frequency) scale — a real byte-level saving on top of `K/r`:
+**6.6% of raw KV at k=2 (15×), 46.9 dB PSNR**, versus 25% / 47.2 dB in fp32.
+
+Math (block size `r`, operating axis `dim=-2`):
+
+- **JPEG**: $X_{\text{blk}} \in \mathbb{R}^{r \times D}$, $C = M_{\text{enc}} X_{\text{blk}}$ with
+  $M_{\text{enc}} \in \mathbb{R}^{K \times r}$, $M[j,n] = c_j \cos\frac{\pi}{r}(n+\tfrac12)j$,
+  orthonormal rows ($K=r$ is per-block lossless); reconstruct $\hat X = M_{\text{enc}}^\top C$.
+- **PNG**: $\Delta_i = x_i - x_{i-1}$ ($i \ge 1$), $x_0$ kept at full precision as the
+  anchor; rebuild $\hat x_i = x_0 + \sum_{j=1}^{i} \Delta_j$ (`cumsum`, purely
+  linear and autograd-differentiable). Autocorrelation implies
+  $\mathrm{Var}(\Delta)/\mathrm{Var}(X) \approx 0.03$ (**30× variance collapse**,
+  measured); after Top-M pruning the residual is nearly zero and sparse.
+
+```
+                    ┌────────────────────────────────────────────┐
+  (B,H,S,D) ──append──▶  raw_buffer (tail < r, full fidelity)     │
+                    │        │ r tokens accumulated, batched      │
+                    │        ▼ archive (single GEMM, in-place     │
+                    │             slice write into)               │
+                    │  compressed_storage (capacity-doubled)      │
+                    │   jpeg: coeffs (B,H,capacity,K,D)           │
+                    │   png:  deltas (B,H,capacity,r-1,D)         │
+                    │         + anchors (B,H,capacity,D)          │
+                    └───────────────┬────────────────────────────┘
+                                    │ read(): one decode of active
+                                    │         region + raw tail
+                                    ▼
+                        reconstructed KV view (B,H,S,D)
+```
+
+Archives live in a **single geometrically-grown buffer** (std::vector-style:
+start at 16 blocks, double on overflow). Each full block is one in-place
+slice write — no re-allocation churn — and `read()` decodes **only the
+newly archived blocks** (one batched GEMM / cumsum per new block, memoized
+in an append-only reconstruction buffer) instead of re-decoding the whole
+history on every decode step. (Fragmented per-block archive lists made
+per-token decode ~170× slower at S=4096 due to kernel-launch overhead.)
+
+## Research note (2026-10): tested against llama.cpp KV quantization — negative result
+
+We tried to take this from a storage prototype to a llama.cpp KV-cache
+replacement: DCT along the sequence axis, instead of or on top of llama.cpp's
+row-wise KV quantization (`-ctk/-ctv`). Four models (Qwen3-0.6B, Hy-MT2-1.8B,
+Gemma4-E2B, plain dense Qwen3-8B), equal bytes, scored with **mean KL +
+top-1 agreement** (perplexity turned out to be a calibration artifact on
+finetuned models, and it disagrees with KL about which of K/V matters):
+
+| variant | 8-bit budget | 4-bit budget |
+|---|---|---|
+| truncation (`k < r`) | — | 2.7× more bytes for the same damage as `q4_0`; `k=2` unusable |
+| lossless basis + per-frequency int8 | 8× more damage than `q8_0` | 13% bytes, unusable |
+| DCT coefficients, ggml per-32 scales | 3× lower KL on 0.6B, neutral on 1.8B/E2B/8B | 2.3× lower KL on 0.6B (still broken), 6–170% **worse** elsewhere |
+| codec stacked on `q8_0` | 0.8% fewer bytes for 63% more damage | — |
+
+At the operating point that actually matters — `q8_0` K + `q4_0` V, 40.6% of
+fp16 KV — the transform is a **no-op** on Qwen3-8B (KL 0.0047 raw vs 0.0045 with
+DCT on K, top-1 97.3% vs 97.2%), while spending the 4 bits on V instead of K is
+worth ~10×.
+
+**Conclusion: not implemented in llama.cpp, and not recommended.** The seq-axis
+transform only wins where row quantization has already destroyed the model;
+wherever quantization is acceptable it is neutral or worse. What survives is the
+mechanism study — the transform redistributes quantization error into a
+slowly-varying subspace (same L2 error, 3–6× less perplexity damage), and KV
+damage depends on architectural exposure and on K/V asymmetry as much as on
+size. Full tables, mechanism and reproduction:
+[`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
+
+## Causal-safety design
+
+Only **complete blocks** are archived; the current incomplete block always
+stays in `raw_buffer` at original precision. During incremental decoding, no
+future perturbation can ever rewrite archived tensors (verified bitwise in
+tests). On the lossless tier (`mode="png", keep_ratio=1.0`), step-by-step
+decoded attention matches full-sequence attention within ≤1e-4.
+
+## Installation
+
+```bash
+pip install flashcodec-kv            # core: torch>=2.0
+pip install "flashcodec-kv[hf]"      # + transformers 5.x backend
+pip install "flashcodec-kv[demo]"    # + gradio/matplotlib for the demo
+pip install -e ".[hf]"               # or from source
+```
+
+Distribution name is `flashcodec-kv`; the import name stays `flashcodec`. (The
+bare `flashcodec` name on PyPI belongs to an unrelated placeholder package, so
+don't `pip install flashcodec`.)
+
+## Usage
+
+### 1. Standalone codec cache (no transformers)
+
+```python
+import torch
+from flashcodec import CodecKVCache
+
+cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2, quant_bits=8)
+k_hat, v_hat = cache.forward(k_seq, v_seq)   # prefill: (B,H,S,D) -> reconstructed view
+k1, v1 = cache.decode_step(k_new, v_new)     # one new token (alias: update)
+print(cache.stats(0))        # tokens / archived / raw / storage_bytes / raw_bytes
+print(cache.storage_bytes()) # archive + raw tail, all layers
+```
+
+`forward` resets that layer and refills it; `decode_step` appends and archives
+whole blocks. Switch to `mode="png", keep_ratio=1.0` for the bitwise-lossless
+tier. `crop(-n)` removes trailing tokens (negative count, HF convention),
+`reorder_cache(beam_idx)` does the beam-search gather, `reset()` keeps the
+allocated capacity.
+
+### 2. transformers 5.x: pass the cache explicitly
+
+```python
+from flashcodec import FlashCodecCache
+
+cache = FlashCodecCache.from_config(
+    model.config, mode="jpeg", block_size=8,
+    keep_freqs=8,      # k = r: full DCT basis (lossless transform)
+    quant_bits=8)      # int8 coefficients -> ~52% of bf16 KV
+out = model.generate(input_ids, max_new_tokens=64,
+                     past_key_values=cache, use_cache=True)
+
+print(cache.get_seq_length())        # prompt + new_tokens - 1
+print(cache.storage_bytes())         # codec layers: archive + raw tail
+print(cache.codec_layer_indices())   # e.g. [3, 7, 11, 15, 19, 23]
+```
+
+`from_config` attaches a codec only to `full_attention` layers, so hybrid models
+(Qwen3.5-style linear + full attention) keep the linear layers native; on a
+plain decoder-only model every layer is compressed. `FlashCodecCache` is a
+regular `transformers.cache_utils.Cache` subclass (5.x layer API), so
+`update` / `get_seq_length` / `crop` / `reorder_cache` behave like the native
+cache.
+
+### 3. One-line hot patch
+
+```python
+from flashcodec import apply_flash_codec, remove_flash_codec
+
+apply_flash_codec(model, mode="jpeg", block_size=8,
+                  keep_freqs=8, quant_bits=8)
+out = model.generate(input_ids, max_new_tokens=64)   # codec cache injected
+remove_flash_codec(model)                            # back to the stock cache
+```
+
+Accepted kwargs: `keep_freqs` (jpeg), `keep_ratio` (png), `quant_bits`
+(`0` or `2..8`; below 8 the coefficients are bit-packed), `channel_scale` /
+`channel_scale_v` (calibrated channel profiles), `per_layer={idx: {...}}` for a
+per-layer budget, and `materialization_free=True` for the decode path below.
+
+### 4. Picking a tier
+
+| goal | config | storage (bf16 KV) | cost (measured, Qwen3-0.6B) |
+|---|---|---|---|
+| bitwise-identical output | `mode="png", keep_ratio=1.0` | ~1.9× | storage only (fp32 deltas) |
+| **recommended (calibrated)** | `keep_freqs=8, quant_bits=7` + profile | **~45%** | +0.025 ppl |
+| tighter (calibrated) | `keep_freqs=8, quant_bits=6` + profile | **~39%** | +0.249 ppl |
+| safe without calibration | `keep_freqs=8, quant_bits=8` | ~52% | +0.52 ppl |
+| 7-bit without calibration | `keep_freqs=8, quant_bits=7` | ~45% | +2.34 ppl |
+| truncation (few codec layers) | `keep_freqs=2` / `4` | 25–50% | collapses on dense models |
+| maximum | `keep_freqs=2, quant_bits=8` | ~13% | collapses on dense models |
+
+Rule of thumb: `keep_freqs = block_size` (full DCT basis) is the premise;
+**dropping bits beats truncating frequencies**, but only after the channel
+profile is calibrated — below 7 bits the archive collapses without it. Hybrid
+models (few codec layers) tolerate truncation much better; measured `k=4` is
+even slightly better than the baseline there.
+
+#### 4.1 Calibrated channel profile (the prerequisite for 7-bit)
+
+Each coefficient row has **one** fp32 scale shared by all 128 channels, but
+per-channel magnitudes differ by orders of magnitude, so most quantizer levels
+are spent on a handful of loud channels. `calibrate_channel_scales` runs one
+forward pass (1–2k tokens) and estimates a static `(keep_freqs, head_dim)` table
+per layer, separately for K and V:
+
+```python
+from flashcodec import calibrate_channel_scales
+
+ids = tokenizer(calib_text, return_tensors="pt").input_ids.to("cuda")
+calib = calibrate_channel_scales(model, ids, keep_freqs=8)   # one forward
+apply_flash_codec(model, mode="jpeg", keep_freqs=8, quant_bits=7,
+                  per_layer=calib)
+```
+
+Same Qwen3-0.6B, 16 x 512-token windows, profile calibrated on a disjoint
+2048-token slice:
+
+| tier | ppl | dppl | storage |
+|---|---|---|---|
+| baseline | 31.1504 | — | 100% |
+| k=8 b=8 | 31.6745 | +0.524 | 51.6% |
+| k=8 b=8 + profile | 31.1210 | −0.029 | 51.6% |
+| k=8 b=7 | 33.4916 | +2.341 | 45.3% |
+| **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
+| k=8 b=6 | 47.2046 | +16.05 | 39.1% |
+| k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+
+Hybrid Qwen3.5-0.8B (only 6/24 layers carry a codec, baseline 23.5318):
+b=7 + profile +0.015, b=6 + profile −0.010. Reproduce with
+`python benchmarks/bench_calibrated.py` (windows are built from the repository's
+own markdown; the calibration slice never overlaps the eval windows).
+
+The profile is a codec constant, so decode pays one broadcast multiply:
+at 64K / k=8 the Triton path goes 0.371 -> 0.414 ms per layer; 7-bit adds the
+gather unpack on top (0.767 ms per layer). `per_layer` may cover only some
+layers.
+
+#### 4.2 Archiving: entropy coding is for disk / transport only
+
+On the hot path the int8 coefficients are read by the attention kernel directly,
+so re-decoding an entropy stream every step would lose; on disk the symbols
+carry ~6.8/8 bits of entropy, so compressing is free money. `save_archive`
+compresses the logical int8 stream + scales + tail (zstd when importable,
+otherwise zlib):
+
+```python
+from flashcodec import save_archive, load_archive
+
+stats = save_archive(cache, "ctx.fckv")   # {"raw_bytes","stored_bytes","ratio"}
+cache2 = load_archive("ctx.fckv", config=model.config, device="cuda")
+```
+
+28-layer Qwen3-0.6B, 4001 tokens, k=8 b=7 + profile: 208.0 MB in memory ->
+181.6 MB on disk (76.7% of the logical payload, 39.6% of the bf16 KV), bitwise
+round trip; save 5.0 s, load 13.2 s on CPU / 1.46 s with `device="cuda"` (the
+7-bit re-pack is ~100x faster on the GPU).
+
+### 5. Materialization-free decode (no KV view)
+
+```python
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=8,
+                  quant_bits=8, materialization_free=True)
+out = model.generate(input_ids, max_new_tokens=64)
+
+from flashcodec import codec_attention_stats
+print(codec_attention_stats(model))   # wrapped attention modules (0 = patch off)
+```
+
+Decode steps attend on the stored DCT rows with the Triton split-K kernel, and
+the prefill view is released, so steady-state memory is the archive only. The
+patch is guarded (single-token, batch=1, eval, no sliding window, standard
+`position_embeddings`) and silently falls back otherwise.
+
+### 6. Diagnostics
+
+| call | returns |
+|---|---|
+| `cache.stats(layer)` | `tokens / archived / raw / storage_bytes / raw_bytes` |
+| `cache.storage_bytes(layer=None)` | archive + raw tail bytes (excludes reserved capacity and the reconstructed view) |
+| `cache.codec_layer_indices()` | layers that actually carry a codec |
+| `codec_attention_stats(model)` | number of wrapped attention modules (`0` = patch off) |
+| `HAS_HF_CACHE` | whether the transformers backend is importable |
+
+### 7. Codec-level API (no cache)
+
+```python
+from flashcodec import JPEGCodec, PNGCodec
+
+codec = JPEGCodec(block_size=8, keep_freqs=2, quant_bits=8)
+coeffs = codec.compress(k_seq)              # (..., n_blocks, k, D)
+q, scale = codec.quantize(coeffs)           # int8 + per-(block, freq) scale
+k_hat = codec.decompress(q, scales=scale)   # (..., S, D), input dtype
+
+png = PNGCodec(block_size=8, keep_ratio=1.0)
+delta, anchor = png.filter(k_seq)
+k_hat = png.reconstruct(delta, anchor)
+```
+
+Tensor contract: `(B, H, S, D)`, compression axis `dim=-2`. The functional API
+(`dct_compress`, `dct_decompress`, `quantize_coeffs`, `dequantize_coeffs`,
+`png_filter`, `png_reconstruct`, `dct_basis`) is exported too.
+
+### 8. Pitfalls
+
+- `pip install flashcodec-kv`, but `import flashcodec` — the PyPI name is the
+  distribution, not the module.
+- From a source checkout, `import flashcodec` must resolve to the package dir,
+  not the project dir of the same name (`pip install -e .`, or run inside it).
+- `crop` takes a **negative** count (`cache.crop(-4)` removes 4 trailing tokens).
+- Beam search works on every tier, but only `png keep_ratio=1.0` is
+  bitwise-identical to the unpatched model.
+- `materialization_free=True` is decode-only and batch=1; batched/padded
+  generation falls back automatically.
+- `quant_bits` is jpeg-only (the png lossless tier must keep fp32 deltas).
+
+### 9. Export a 7-bit model bundle
+
+flashcodec compresses the **KV cache at inference time**; the weights are never
+quantized (they stay bf16). "Exporting a 7-bit model" therefore means the
+original checkpoint plus a `flashcodec-kv.json` sidecar carrying the codec tier
+and the per-layer, per-stream (K/V) channel profiles:
+
+```bash
+python -m flashcodec.export Qwen/Qwen3-0.6B ./qwen3-0.6b-fckv \
+    --calib-text calibration.txt        # add --save-weights for a self-contained dir
+python -m flashcodec.export --inspect ./qwen3-0.6b-fckv
+
+# checkpoints that do not fit on one device (needs accelerate):
+python -m flashcodec.export deepseek-ai/DeepSeek-V2-Lite ./dsv2-lite-fckv \
+    --calib-text calibration.txt --device-map auto   # 80% of free VRAM by default
+```
+
+```text
+format   : flashcodec-kv-model v1
+base     : Qwen/Qwen3-0.6B  (weights referenced)
+codec    : jpeg block=8 keep_freqs=8 quant_bits=7
+calib    : 2048 tokens, q0.95
+layers   : 28
+profiles : [(8, 128)]
+storage  : ~45.3% of bf16 KV (one stream)
+```
+
+Load it (`flashcodec-export` is the same command as a console script):
+
+```python
+from flashcodec import load_pretrained
+
+model, tok = load_pretrained("./qwen3-0.6b-fckv")
+inputs = tok("Explain KV cache compression in one sentence.",
+             return_tensors="pt").to(model.device)
+out = model.generate(**inputs, max_new_tokens=128)
+print(model._flashcodec["caches"][0].storage_bytes())   # actual archive
+```
+
+`load_pretrained` loads the weights, applies `apply_flash_codec` with the 7-bit
+tier and the stored profiles, and generation uses it immediately. If you loaded
+the model yourself, use `apply_export(model, read_manifest(path))`. To export a
+different tier just change `--quant-bits` — the profiles are tier-independent
+and reused.
+
+Measured on Qwen3-0.6B with 2048 calibration tokens: 313 KB for 28 layers,
+45.3% of bf16 KV, and the generated tokens are identical to the uncompressed
+model on the same prompt.
+
+**Compatibility**: any decoder-only CausalLM on transformers 5.x whose cache is a
+`Cache` with `.layers`. Dense models calibrate every layer; hybrid architectures
+only calibrate the `full_attention` layers (measured on Qwen3.5-0.8B: 6/24
+layers, 133 KB bundle, token-identical generation); sliding-window layers keep
+the native cache and get no codec. Architectures without a KV cache
+(Mamba/RWKV) fail loudly. Custom architectures need `--trust-remote-code`, and
+the calibration length is clamped to the model's `max_position_embeddings`.
+
+**MLA (DeepSeek-V2/V3)**: the cache stores one latent per token per layer — the
+`kv_lora_rank` compressed key plus the shared RoPE key (576 elements for
+V2-Lite) — instead of per-head K/V, and flashcodec compresses exactly that
+tensor, so MLA works unchanged. Measured on the real DeepSeek-V2-Lite
+checkpoint (`benchmarks/bench_mla.py`, 27 layers): 7-bit + profile is 44.4% of
+the bf16 latent cache, ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), and the
+generated tokens are identical. Two caveats: the MLA latent is already ~7x
+smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128),
+and transformers' `expand_kv` rebuilds the per-head keys/values on every
+forward, so only the *stored* cache shrinks — the 4K decode step measured
+954 ms raw vs 959 ms with the codec. When the checkpoint does not fit on one
+device, export with `--device-map auto` (needs `accelerate`; it budgets 80% of
+free VRAM plus host RAM, and `--max-gpu-gib` overrides the VRAM figure).
+
+
+## Transformers integration (real-world tested on Qwen3.5-0.8B)
+
+Hybrid architectures (e.g. Qwen3.5: 18 linear-attention layers + 6
+full-attention layers) are handled automatically —
+`FlashCodecCache.from_config(model.config)` attaches codec layers **only to
+`full_attention` layers** and keeps native dynamic layers for everything
+else (recurrent/conv states untouched). `apply_flash_codec` uses `from_config`
+whenever a model config is available.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from flashcodec import apply_flash_codec
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B",
+                                             torch_dtype="bfloat16").cuda()
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+ids = tok("A quiet lake at dawn", return_tensors="pt").input_ids.cuda()
+
+# One line — every generate() now runs on the codec cache
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2)
+out = model.generate(ids, max_new_tokens=48, do_sample=False)
+```
+
+Measured on Qwen3.5-0.8B (bf16, CUDA, 48 greedy tokens, `benchmarks/run_qwen_demo.py`):
+
+| Tier | Storage vs raw KV | Output | Verdict |
+|---|---|---|---|
+| `png keep=1.0` | ~1.8× (fp32 deltas for exactness) | **bit-identical tokens to the unpatched model** | 100% fidelity baseline |
+| `jpeg k=8 int8` | **55.5%** (~1.8×) | fluent, **100% token match** | safe lossy tier |
+| `jpeg k=2` | **32.3%** (~3.1×) | fluent, 38.1% token match | lossy tier |
+| `jpeg k=4` | 54.8% (~1.8×) | fluent, 49.2% token match | lossy tier |
+| `jpeg k=2 int8` | **21.1%** (~4.7×) | fluent, 38.1% token match | lossy + int8 |
+
+Hybrid-layer audit: `codec_layers=6/24` (full attention only), zero warnings.
+Reproduce with `python benchmarks/run_qwen_demo.py` (offline; honors
+`FLASHCODEC_MODEL` / `FLASHCODEC_NEW_TOKENS`).
+
+dtype contracts (see `AGENTS.md`): PNG deltas are always fp32 (bf16
+differences lose the bitwise-exactness the lossless tier promises); JPEG
+coefficients and `read()` views stay in the stream's input dtype (SDPA
+requires q/k/v dtype parity).
+
+## Materialization-free decode attention
+
+Every codec here is a **linear map along the seq axis**: the r tokens of a block
+are `K_block = A @ S`, where `S` are the stored rows (DCT coefficients, or
+anchor + deltas) and `A` is the synthesis matrix. So a decode query can attend
+on `S` directly:
+
+```
+q . K[p] = (q . S^T) @ A[p]        out = (prob @ A) @ S
+```
+
+`codec_decode_attention(q, key_stream, value_stream)` implements this for one
+new token (jpeg k<r, jpeg int8 and png; GQA grouping included). The `(S, D)`
+reconstruction never exists, and the result matches the materialized path to
+≤1e-6.
+
+Measured (`benchmarks/bench_attention.py`, B=1, H_kv=8, H_q=16, D=64, fp32):
+
+| seq | mode | materialized | coefficient-domain |
+|---|---|---|---|
+| 16384 | jpeg k=2 int8 | 0.20ms / 130MB | 0.30ms / **32MB** |
+| 65536 | jpeg k=2 int8 | 0.86ms / 520MB | **0.46ms / 128MB** |
+| 65536 | png keep=1.0 | 0.87ms / 520MB | 1.03ms / 272MB |
+
+Scope: **decode only** (prefill still uses the view — the coefficient form would
+explode the score tensor). png stores r rows per block, so it is numerically
+supported but gains nothing; the win is jpeg `k < r`.
+
+A **Triton split-K kernel** (`flashcodec/triton_attention.py`, flash-decoding
+style: block chunks write partial max/sum/acc, a combine kernel merges them)
+removes the intermediate tensors and the launch overhead. One layer, B=1,
+H_kv=8, H_q=16, D=128, `jpeg k=2 int8` (`benchmarks/bench_attention.py --cuda`):
+
+| seq | materialized | coefficient (torch) | coefficient (Triton) |
+|---|---|---|---|
+| 16384 | 0.20ms / 130MB | 0.29ms / 24MB | **0.09ms / 0MB** |
+| 65536 | 0.86ms / 520MB | 0.41ms / 96MB | **0.16ms / 0MB** |
+
+`apply_flash_codec(model, ..., materialization_free=True)` wires it into
+transformers: the forward of standard Llama/Qwen-style attention modules is
+wrapped (projection + RoPE unchanged, the attention output replaced), guarded to
+single-token / batch-1 / eval / non-sliding layers, otherwise it falls back to
+the original path. The prefill reconstruction is released on the first decode
+step. `remove_flash_codec` restores everything.
+
+End-to-end (`benchmarks/bench_e2e.py`, Qwen3-0.6B, 4096-token prompt + 32 new):
+
+| tier | tok/s | peak | steady |
+|---|---|---|---|
+| baseline (raw KV) | 52.1 | 581MB | 0MB |
+| codec k=2 int8, materialized | 44.2 | 1545MB | 1535MB |
+| codec k=2 int8, materialization-free (Triton) | 40.3 | **642MB** | **122MB** |
+
+**12.6× less steady memory** at ~9% slower decode than the materialized path
+(per decode step at 4096 tokens: 22.8ms vs 21.7ms materialized, 17.8ms raw).
+The remaining gap is the per-layer split/combine launch pair; a persistent
+kernel would close it.
+
+## Demo (side-by-side chat on Qwen3.5-0.8B)
+
+![flashcodec side-by-side Gradio demo](images/demo.png)
+
+Same prompt, two panels: native KV cache on the left, flashcodec on the right
+(five tiers: png lossless / jpeg k=8 int8 / k=4 / k=2 / k=2 int8), with a
+materialization-free toggle (coefficient-domain + Triton) and per-turn stats:
+KV footprint (archive vs materialized view), peak/steady memory, per-token
+latency and token match.
+
+The **Full comparison** tab runs the baseline plus every tier on one prompt and
+reports, per tier: KV footprint vs raw, archive/view split, decode tok/s,
+peak/steady memory, teacher-forced NLL of the continuation (a perplexity-style
+quality number) and token match — plus storage / speed / NLL bars.
+
+```bash
+pip install -e ".[demo]"   # gradio + matplotlib
+python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
+```
+
+## Benchmarks (measured; B=2 H=8 S=2048 D=64, random-walk autocorrelated signal, fp32)
+
+### Reconstruction quality (`benchmarks/bench_reconstruct.py`)
+
+| Config | PSNR (dB) | cosine | Storage |
+|---|---|---|---|
+| jpeg r=8 k=1 (8×) | 42.95 | 0.99943 | 12.5% |
+| jpeg r=8 k=2 (4×) | 47.22 | 0.99985 | 25.0% |
+| jpeg r=8 k=4 (2×) | 51.66 | 1.00001 | 50.0% |
+| jpeg r=8 k=2 int8 | 46.92 | 0.99983 | 6.6% |
+| jpeg r=8 k=4 int8 | 50.89 | 0.99999 | 13.3% |
+| png r=8 keep=0.5 | 50.11 | 0.99997 | 100% (sparsity → entropy coder) |
+| png r=8 keep=1.0 | ~196 (fp rounding) | 1.00000 | 100% |
+
+### Real KV statistics (real models, 512 tokens)
+
+`bench_reconstruct` uses a synthetic random walk; real caches are messier.
+Measured on real post-RoPE KV (`Var(Δ)/Var(X)` along the seq axis, and the
+fraction of block energy kept by the lowest k=2 DCT coefficients of a block of
+8):
+
+| model / layer | tensor | Var(Δ)/Var(X) | energy in k=2 |
+|---|---|---|---|
+| Qwen3-0.6B L0 | K | 0.16 | 0.94 |
+| Qwen3-0.6B L0 | V | 1.87 | 0.31 |
+| Qwen3-0.6B L27 | V | 1.02 | 0.59 |
+| Qwen3.5-0.8B L3 | K | 0.72 | 0.71 |
+| Qwen3.5-0.8B L23 | V | 0.09 | 0.97 |
+
+Values are frequently **anti**-correlated (ratio > 1), so "first differences
+collapse the variance" is a property of smooth synthetic signals, not of every
+real layer. Practical consequence: coefficient truncation (`k < r`) is a
+per-layer decision — on a dense model (28 compressed layers) the error compounds
+and quality collapses; use `k = r` + `quant_bits=8` there.
+
+### Perplexity (`benchmarks/bench_ppl.py`; 16 × 512 tokens, bf16, local corpus)
+
+| tier | Qwen3.5-0.8B (6/24 layers) | Qwen3-0.6B (28/28 layers) | storage |
+|---|---|---|---|
+| baseline | 22.4803 | 16.7931 | 100% |
+| png keep=1.0 | 22.4803 (+0.000) | 16.7931 (+0.000) | 188% |
+| jpeg k=8 (lossless basis) | 22.4877 (+0.007) | 16.8058 (+0.013) | 100% |
+| **jpeg k=8 int8** | **22.4991 (+0.019)** | **17.1348 (+0.34)** | **~52%** |
+| jpeg k=4 | 22.3010 (−0.18) | 470.85 (+454) | 50% |
+| jpeg k=2 | 24.0566 (+1.58) | 6485.5 (+6469) | 25% |
+| jpeg k=2 int8 | 24.0590 (+1.58) | 8118.5 (+8102) | 13% |
+
+The hybrid result is good because only 6 of 24 layers carry a codec (the 18
+linear-attention layers keep their native state); the dense model shows why
+per-layer truncation must not be applied blindly.
+
+### Per-layer budgets (`benchmarks/bench_adaptive.py`, Qwen3-0.6B, 6 × 512 tokens)
+
+Calibration: compress one layer at a time to k=4, measure the perplexity damage,
+then give the cheapest half of the layers k=4 and leave the rest at k=r (75%
+storage):
+
+| schedule | ppl | Δppl | storage |
+|---|---|---|---|
+| baseline (k=r) | 18.9786 | — | 100% |
+| uniform k=6 | 48.0531 | +29.07 | 75% |
+| adaptive (14 layers k=4) | 40.8309 | +21.85 | 75% |
+| uniform k=4 | 710.22 | +691.24 | 50% |
+| uniform k=r int8 | 19.3627 | +0.38 | 50% |
+
+Calibration beats a uniform budget at the same storage (−15%), but the damages
+are **super-additive** (the cheapest 14 layers add up to +22 ppl although no
+single one costs more than +0.5), and int8 at 50% is far better. Use
+`per_layer={idx: {"keep_freqs": ...}}` when a budget forces structural
+truncation; otherwise prefer `quant_bits=8`.
+
+### Cache footprint & latency (`benchmarks/bench_vram.py`, CPU)
+
+| seq | Mode | storage | ratio | fill | read |
+|---|---|---|---|---|---|
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 6.7ms | 0.0ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 34.3ms | 0.5ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 141.9ms | 3.1ms |
+| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 9.2ms | 0.0ms |
+| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 46.0ms | 0.3ms |
+| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 197.9ms | 3.1ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 243.3ms | 3.3ms |
+
+CPU timings vary ~±20% between runs (min of 3); the storage/ratio columns are
+exact. `read` = materialize the view and touch it (`.sum()`, so the number is the
+consumer cost, not just kernel launch). Decoding is memoized per archived block,
+so `read` costs one decode per **new** block instead of re-decoding the whole
+history on every decode step (previously 38.7ms / 71.9ms in the last two rows).
+
+PNG does not shrink dense storage (the fate of a lossless tier) — its value is
+the 30× variance collapse plus near-zero sparse residuals after Top-M, i.e.
+ideal input for an entropy coder (none is bundled).
+
+## Same-bytes comparison with llama.cpp KV quantization
+
+llama.cpp ships row-wise KV quantization (`-ctk/-ctv`), so the fair question is
+not "does the codec compress" but "does it beat what llama.cpp already has at
+the same byte budget". Measured on the same model (Qwen3-0.6B, wikitext,
+llama.cpp `184f65360`, CUDA + FA):
+
+| KV config | ppl | Δ vs fp16 | of fp16 bytes |
+|---|---|---|---|
+| `-ctk f16 -ctv f16` | 19.6037 | — | 100% |
+| `-ctk q8_0 -ctv q8_0` | 19.6138 | +0.05% | 53.1% |
+| `-ctk q8_0 -ctv q4_0` | 19.6579 | +0.28% | 40.6% |
+| `-ctk q4_0 -ctv q4_0` | 65.8321 | +236% | 28.1% |
+
+Against that bar, flashcodec's **current archive format** does not win at equal
+bytes:
+
+- **truncation (`k < r`)**: `jpeg k=4` on K (75% of fp16 K bytes) damages as
+  much as `q4_0` on everything (28% of fp16 KV bytes) — 2.7× more bytes for the
+  same damage; `k=2` is unusable on dense models.
+- **lossless basis + `quant_bits=8`** (≈50% of fp16 bytes): +0.38% ppl at
+  b32/k32, versus +0.05% for `q8_0` — 8× more damage for the same budget.
+- **stacking on top of llama.cpp's quantizer** does not help either: on `q8_0`
+  the codec reclaims 0.8% of the bytes (one scale per 128 values instead of one
+  per 32) for 63% more damage, and on `q4_0` an int8 coefficient archive is
+  *larger* than the 4-bit payload it replaces (39.8% vs 28.1%).
+
+**The coefficient quantizer is what loses, not the transform.** Give the
+coefficients the same per-32 absmax that ggml uses (lossless basis, identical
+byte count) and the ordering reverses: **5× less perplexity damage at 8 bits and
+7× less at 4 bits**, with the reconstruction error unchanged — the transform
+shifts the quantization error into the slowly-varying subspace, which softmax
+barely sees (error shaping, not a better K). Measured in HF; still to be
+confirmed inside llama.cpp, and it does not make 4-bit K usable on this model
+(ppl 41.6 vs 18.6).
+
+The measurements also show K and V are asymmetric: 4-bit **K** is the only
+cliff (K alone at `q4_0` → +237%), while 4-bit V is nearly free (+0.29%). So
+the cheap production setting is `-ctk q8_0 -ctv q4_0`. But that cliff is a
+**small-model** property: on a 27B hybrid (`qwen35`, 17 KV-bearing layers)
+`q4_0` KV costs +0.39% at 8k context and +0.20% at 32k, so production-scale
+models have no byte-budget problem for this codec to solve.
+
+**Dense mid-size models are where 4-bit KV is costly but not fatal**, and also
+where perplexity stops working as a metric. Gemma4-12B (48 layers, 40 SWA + 8
+global MQA) measured with `--kl-divergence`: KL 0.17 at 8 bits, 0.30 at 4 bits,
+top-1 agreement 89% (versus 0.0035 on the 27B hybrid). Its ppl ranges from 2.2
+to 355 depending on the corpus and sometimes *improves* under quantization, so
+ppl cannot be used there.
+
+**The HF-side KL pre-judgment then closes the follow-up**: at equal bytes the
+transform helps only where row quantization is already destructive (Qwen3-0.6B:
+3× lower KL at 8 bits, 2.3× at 4 bits but still broken), is neutral at 8 bits /
+slightly worse at 4 bits on Hy-MT2-1.8B and Gemma4-E2B, and on a **plain dense
+Qwen3-8B** — the most favourable case — it changes nothing at the operating
+point that matters (`q8_0` K + `q4_0` V at 40.6% bytes: KL 0.0047 raw vs 0.0045
+with DCT on K, top-1 97.3% vs 97.2%) while being 6% worse at 4 bits on both
+sides. There is no operating point where it is worth shipping — so **no
+llama.cpp integration follows from this**. Full tables, mechanism and
+reproduction:
+[`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
+
+## Why not offload V to host / a video stream (measured)
+
+The proposal: keep K in VRAM (high-frequency, exact matching), pack V into a
+JPEG/AV1 stream on host RAM or disk, and decode it with NVDEC asynchronously —
+breaking the HBM wall. Three measurements close that path
+(`python benchmarks/bench_offload.py`; Qwen3-0.6B on an RTX 5090 D, PCIe Gen4
+x8, pinned H2D measured at 10.7 GB/s):
+
+| context | decode step | V (8-bit) | H2D | xfer/step | concurrent step | NVDEC/step |
+|---|---|---|---|---|---|---|---|
+| 4K | 16.1 ms | 117 MB | 11.0 ms | 0.7x | 18.4 ms (1.1x) | 37.4 ms |
+| 16K | 16.1 ms | 470 MB | 44.0 ms | 2.7x | 47.3 ms (2.9x) | 149.6 ms |
+| 64K | 17.9 ms | 1879 MB | 176.1 ms | 9.8x | 177.4 ms (9.9x) | 598.3 ms |
+
+1. **The decode step is launch-bound and barely grows with context**
+   (16 -> 18 ms from 4K to 64K), while the V volume grows linearly in S. So the
+   transfer/step ratio *gets worse* with longer contexts; there is no
+   "long context makes it worth it" crossover.
+2. **The wall is PCIe, not NVDEC.** Decoding V through NVDEC every step is
+   10-33x the step; and even if the decode were free, moving 1.88 GB of pixels
+   into VRAM costs 176 ms. The NVDEC column is the decode alone, before any
+   bitstream transfer.
+3. **"V is the tough one, K the sensitive one" does not hold at 7 bits**
+   (`--kv-split`, same calibrated profile): V-only -0.050 ppl, K-only -0.078,
+   both +0.003; at 6 bits V-only +0.164, K-only -0.022. The K/V asymmetry is a
+   4-bit phenomenon (see the llama.cpp section); at usable depths both streams
+   are equally cheap.
+
+So: **at <=4K, V offload costs ~10%** (acceptable, but it only saves 235 MB of
+VRAM); **from 8K it exceeds the step (2.9x at 16K, 9.9x at 64K)**. The right move is to keep V
+in VRAM at 7 bits (45%, zero PCIe, +0.03 ppl), not to move it to host memory or
+a video stream.
+
+The only defensible use: land V on **disk** for cold start / cross-machine
+transfer (`save_archive`) and decode once in the background — never on the
+per-step path.
+
+## Repository layout
+
+```
+flashcodec/
+├── flashcodec/
+│   ├── __init__.py        # apply_flash_codec / CodecKVCache / JPEGCodec / PNGCodec
+│   ├── codecs/jpeg.py     # DCT-II basis, project/reconstruct (pure GEMM, no loops)
+│   ├── codecs/png.py      # anchor + first-order delta, cumsum, Top-M filter
+│   ├── cache.py           # CodecKVCache: raw tail + capacity-doubled archives
+│   ├── calibrate.py       # per-layer/stream channel profile (one forward pass)
+│   ├── storage.py         # save_archive / load_archive (zlib/zstd, disk & transport)
+│   ├── export.py          # export_model / load_pretrained (7-bit calibrated bundle)
+│   ├── attention.py       # materialization-free decode attention (coefficient domain)
+│   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
+├── tests/                 # jpeg / png / causal / attention / calibrated-bits / storage / export
+├── benchmarks/            # storage, PSNR/cosine, ppl+calibration, offload/NVDEC, MLA
+├── docs/                  # measured comparisons (vs llama.cpp KV quantization)
+├── demo/                  # Gradio side-by-side chat
+├── images/                # README screenshots
+├── .github/workflows/     # CI: CPU tests + transformers integration
+├── CHANGELOG.md
+├── pyproject.toml
+└── README.md
+```
+
+## Tests
+
+```bash
+python tests/test_jpeg.py           # orthonormality, k=r lossless, k=2 cosine>0.99, K monotone
+python tests/test_png.py            # lossless maxdiff<1e-6, variance ratio printed, differentiable
+python tests/test_causal.py         # zero future leakage, incremental vs full ≤1e-4,
+                                   # memoized read == full decode, exact + repeatable crop,
+                                   # beam-search batch gather
+python tests/test_hf_integration.py # native transformers 5.x generate: explicit cache / hot patch /
+                                    # PNG lossless exact tokens / 70-token multi-block stability /
+                                    # beam search + crop exactness against the unpatched model /
+                                    # per-layer schedule
+python tests/test_attention.py      # coefficient-domain decode attention matches the materialized
+                                    # path (jpeg / int8 / png, GQA); never builds the KV view
+python tests/test_calibrated_bits.py # bit-packing round trip (2..8 bits), calibrated profile lowers
+                                    # error, packed archives stay causal, Triton == torch
+python tests/test_storage.py        # save/load bitwise round trip (CodecKVCache + FlashCodecCache),
+                                    # compressed smaller than raw, multi-layer needs a config
+python tests/test_export.py         # manifest round trip, profile reload, patched generation,
+                                    # archive ratio
+```
+
+## Stability (1.x)
+
+The public API is frozen for 1.x: `apply_flash_codec` / `remove_flash_codec`,
+`apply_codec_attention` / `remove_codec_attention`, `FlashCodecCache`,
+`FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
+`codec_decode_attention`, `make_codec`, plus the `quant_bits` / `per_layer`
+options. New features ship as additive arguments; existing signatures keep
+their defaults. The caveats below still apply — this is a research library with
+a stable interface, not a claim of production readiness.
+
+## Boundaries (honest list)
+
+- Research prototype: `read()` materializes the full reconstructed view for
+  attention; memory gains are at the **cache storage layer** (table above);
+  end-to-end benefits require combining with materialization-free kernels
+  (flash-attention style). That view is memoized and reused across decode
+  steps, so steady-state memory = archive + one raw-KV-sized view.
+- Full-sequence `forward(seq)` prefill compresses complete blocks directly, so
+  mid-block attention sees the block-level reconstruction (within-block
+  approximation); the incremental `decode_step` path has no such issue.
+- Compressed tensors are dense layouts; PNG Top-M sparsity is not yet wired to
+  an entropy coder. (Packing sparse png alone was measured to be a wash: the
+  fp32 delta values dominate, and on bf16 input the packed form can be *larger*
+  than raw — delta quantization has to come first.)
+- Coefficient truncation (`k < r`) is a per-layer decision: on a dense model
+  every layer is compressed and the error compounds (measured: Qwen3-0.6B
+  perplexity 16.8 → 6486 at k=2). Use `k = r` + `quant_bits=8` there (~52%
+  storage, +2% ppl) and reserve aggressive ratios for hybrid models where only
+  the full-attention layers carry a codec.
+- **Not a better KV quantizer than llama.cpp's — as an archive format.** At
+  equal bytes (truncation, and lossless basis + `quant_bits=8`: +0.05% vs
+  +0.38% ppl); 4-bit V is nearly free while 4-bit K is the only cliff. The
+  *transform* is another matter: give the coefficients ggml's per-32 absmax and
+  it wins 5×/7× at 8/4 bits with the same reconstruction error — measured in HF,
+  not yet confirmed in llama.cpp. See
+  [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
+- Same lineage as the v4.2 prototypes inside
+  [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
+  (there: per-position view semantics for cross-layer KV reuse; here:
+  standard cache storage semantics).
+
+## License
+
+[MIT](LICENSE)
+
+
+# AGENTS.md — flashcodec
+
+Standalone open-source project: compresses Transformer time-series KV cache tensors
+as "high-dimensional multimedia image signals" (jpeg = frequency-domain DCT lossy /
+png = time-domain delta lossless). Pure torch, no pytest dependency, no CI.
+Read this whole file before making changes.
+
+## Running conventions
+
+- **You must run from inside this directory (`flashcodec/`)**: the package and the
+  project directory share a name, so `import flashcodec` from the parent directory
+  only hits the namespace package (no `__version__`/exports) — an inherent trap of
+  this same-name layout. After `pip install -e .` it imports from anywhere.
+- Tests are plain runnable scripts (`assert` + `__main__` summary, function names
+  are pytest-compatible): `python tests/test_jpeg.py`, `python tests/test_png.py`,
+  `python tests/test_causal.py`, `python tests/test_hf_integration.py`,
+  `python tests/test_calibrated_bits.py`, `python tests/test_storage.py`.
+  Run all six after touching codecs/cache.
+- Benchmarks: `python benchmarks/bench_reconstruct.py` (PSNR/cosine),
+  `python benchmarks/bench_vram.py [--cuda]` (storage occupancy/timings).
+- This directory is gitignored inside the host repo — it is an independent git
+  repository with independent releases.
+
+## transformers integration (only targets local 5.20; 4.x explicitly unsupported)
+
+- `FlashCodecLayer(DynamicLayer)` + `FlashCodecCache(Cache,
+  layer_class_to_replicate=partial(...))`: 5.x's Cache is a layer container, and
+  the base class lazily creates layers and hands them down to the layer; **5.x
+  attention consumes the return value of `update` directly** (it does not read
+  `key_cache`), so layer.update must return the reconstructed full causally-visible
+  KV.
+- `apply_flash_codec`'s main hook is `model.generate` (5.x generate builds its own
+  DynamicCache internally, so injection only takes effect at the entry point); the
+  forward wrapper is secondary.
+- Generation semantics: **cache length = prompt + new_tokens - 1** — the last
+  generated token's KV is never computed (nobody attends to it), so don't write the
+  assertion as the total length.
+- Integration-test traps: a randomly initialized tiny model will emit eos and stop
+  early (disable it with `generation_config.eos_token_id = None`); scaling lm_head
+  by 20 creates a clear argmax margin, isolating tie jitter and focusing on the
+  cache mechanism.
+- `crop` (speculative decoding path) is exact: archived blocks are kept
+  verbatim, only the boundary partial block returns to the raw tail (no
+  re-compression, so repeated crops are idempotent); `reorder_cache` /
+  `batch_repeat_interleave` / `batch_select_indices` gather the archive + tail too
+  (beam search is bitwise-identical on the lossless tier); `offload/prefetch` are
+  still no-ops.
+- `_CodecStream.read()` is **memoized**: decoded archive blocks are kept in a
+  persistent append-only `_rec` buffer (one decode per new block instead of
+  re-decoding the whole history per decode step — measured 38.7ms → 5.2ms at
+  S=64K in bench_vram). Two consequences not to "optimize away": (1) `read()`
+  returns a **view** into `_rec` when the raw tail is empty, so structural ops
+  must not write the live region in place (`select_batch` allocates a new buffer;
+  `reset()` is the explicit invalidation point); (2) the reconstruction buffer is
+  persistent, so steady-state memory includes one raw-KV-sized view (before, it was
+  a per-read temporary — peak is unchanged, steady state is higher).
+- **jpeg int8 (`quant_bits=8`)**: coefficients are int8 plus a per-(block,
+  frequency) fp32 scale (`_scales (B,H,cap,k,1)`); decode = dequantize → DCT.
+  Real byte saving (fp32 archive 25% → 6.6%, bf16 archive 25% → ~13%) at ~0.3 dB
+  PSNR and +2% ppl on a dense model. png rejects `quant_bits` on purpose (the
+  lossless tier must keep fp32 deltas).
+
+## dtype contract (distilled from Qwen3.5-0.8B practice; read before changing codecs)
+
+- **PNG deltas are always fp32**: computing the deltas of bf16 inputs in bf16 loses
+  ~0.4% precision, and cumsum reconstruction is no longer bitwise-exact (bf16
+  deltas are exactly representable in fp32, so anchor+ΣΔ restores the original
+  values bitwise) — this is the basis for "lossless → generated tokens are
+  bitwise-identical to the baseline". Under bf16 deployment the archive is about
+  1.9× dense (bandwidth traded for exactness).
+- **JPEG coeffs are stored in the input dtype** (computed in fp32, then cast):
+  lossy modes need no higher precision, and the storage ratio isn't inflated
+  (k=2 measured ~27% raw).
+- **`_CodecStream.read()` uniformly restores the stream's input dtype**: SDPA
+  requires q/k/v to share a dtype, so feeding fp32 views to a bf16 model crashes
+  outright.
+- Hybrid architecture (Qwen3.5: 18 linear_attention + 6 full_attention): you must
+  use `FlashCodecCache.from_config(model.config)` to attach a codec only to
+  full_attention layers per layer_types, leaving the other layers as native dynamic
+  layers (recursive state and other interfaces are unaffected);
+  `apply_flash_codec` already routes through from_config automatically.
+- Practical script: `benchmarks/run_qwen_demo.py` (PNG lossless bitwise-identity
+  assertion + JPEG storage-ratio/fluency report + hybrid-layer audit).
+
+## Tensor contract (read before changing any signature)
+
+- KV layout `(B, H, S, D)`; **the compression/filtering axis is always dim=-2 (the
+  seq axis)**.
+- Codecs may only use batched matmul/elementwise operators; **explicit Python for
+  loops are forbidden**; the trailing partial block is zero-padded
+  (`_pad_to_blocks`) and trimmed back via `out_len`.
+- Codecs compute in fp32 uniformly (`dct_compress` and friends call `.float()`
+  internally); DCT with keep=r and PNG with keep_ratio=1 are the "lossless"
+  baselines (fp round-trip on the ~1e-6/1e-7 level; see the tests for assertion
+  tolerances, and don't tighten them to bitwise).
+
+## Causal-safety invariants (breaking these is a bug)
+
+1. **Archive complete blocks only**; an incomplete block always stays in
+   `raw_buffer` (original precision) — a future perturbation at any point during
+   incremental decoding must never rewrite already-archived tensors (`test_causal`
+   verifies this bitwise).
+2. The two fill paths — full `forward(seq)` and stepwise `decode_step` — must
+   produce **bitwise-identical archives** (compression is per block and grouping
+   invariant) and views that agree exactly on png (cumsum is per-block) and within
+   ≤1e-6 on jpeg (batched-GEMM reduction order depends on the batch size once
+   `read()` is memoized: one block vs N blocks; on some BLAS builds it is bitwise,
+   on others not — don't assert `torch.equal` for jpeg).
+3. In the `mode="png", keep_ratio=1.0` lossless mode, stepwise decoding attention
+   must align with the full forward pass within ≤1e-4 (the tests' correctness
+   anchor).
+
+## Evaluation findings (measured; don't re-litigate without data)
+
+- **Real post-RoPE KV is not uniformly smooth.** `Var(Δ)/Var(X)` along seq:
+  K ≈ 0.16–0.72, V ≈ 0.09–1.87 across Qwen3-0.6B / Qwen3.5-0.8B layers (values
+  are often *anti*-correlated). The 30× variance-compression number in
+  `test_png` is a property of the synthetic random walk — keep
+  `bench_reconstruct` labelled synthetic and don't cite it as a real-KV claim.
+- **Truncation compounds per layer.** Dense Qwen3-0.6B (28/28 layers): ppl
+  16.79 → 470 (k=4) → 6486 (k=2). Hybrid Qwen3.5-0.8B (6/24 layers): 22.48 →
+  22.30 (k=4) → 24.06 (k=2). Safe default for dense models is **k = r +
+  `quant_bits=8`**: ~52% of bf16 storage, ppl 16.79 → 17.13 (+2%).
+- **Sparse-png packing alone is a wash** (fp32 delta values dominate; bf16 input
+  makes the packed form larger). Delta quantization would have to come first —
+  don't ship bit-packing without it.
+- **End-to-end overhead is small at short context** (Qwen3.5-0.8B, 48 new
+  tokens: baseline 47.0 tok/s vs 43.5–49.5 tok/s with codec tiers, peak +30MB),
+  but peak memory ≈ raw KV + archive because `read()` materializes a view;
+  memory wins need materialization-free kernels (flash-attention style).
+
+## Materialization-free decode attention (`flashcodec/attention.py`)
+
+- Both codecs are linear along seq: the r tokens of a block are `A @ S` (jpeg:
+  `A = M^T` (r,k), `S` = coeffs or dequantized int8; png: `A = tril(ones)`,
+  `S = [anchor; deltas]`). Therefore `q·K[p] = (q·S^T) A[p]` and
+  `out = (prob·A) S` — decode attention without ever building the view.
+  GQA is grouped over query heads; never `repeat_interleave` the stored rows.
+- **Decode only** (`Sq == 1`); prefill would blow up the score tensor. png is
+  numerically supported but stores r rows per block, so it saves nothing — the
+  win is jpeg `k < r`. Remaining peak is the int8→fp32 dequantization of rows.
+- Measured (B=1 H_kv=8 H_q=16 D=128, 64K, jpeg k=2 int8): materialized
+  0.89ms/520MB → coefficient-torch 0.43ms/96MB → **coefficient-Triton
+  0.17ms/0MB**. The Triton kernel is `flashcodec/triton_attention.py`
+  (split-K + combine, flash-decoding style); `do_not_specialize` on
+  nb/nr/chunk/ns is required, otherwise every new sequence length recompiles.
+  `impl="auto"` picks Triton on CUDA and falls back to torch for png / CPU /
+  D>256 / no blocks.
+- **HF integration**: `apply_flash_codec(..., materialization_free=True)` wraps
+  standard Llama/Qwen-style attention forwards (`patch_attention.py`); guards are
+  batch=1 / single-token / eval / no sliding window / standard
+  `position_embeddings`, otherwise it falls back silently. Prefill still
+  materializes; the first decode step drops the view (`discard_view()` +
+  `layer.keys = None`, otherwise the prefill view stays referenced and no memory
+  is saved).
+- End-to-end (Qwen3-0.6B, 4096-token prompt + 32 new): baseline 52.1 tok/s /
+  peak 581MB; codec k=2 int8 materialized 44.2 tok/s / steady 1535MB; with
+  materialization-free (Triton) 40.3 tok/s / peak 642MB / steady 122MB.
+  Per decode step: raw 17.8ms, materialized 21.7ms, Triton 22.8ms — **12.6×
+  less steady memory for ~9% slower decode**. A persistent kernel is the
+  remaining optimization (the per-layer split/combine launch pair).
+- `per_layer={idx: {keep_freqs/quant_bits/...}}` on `from_config` applies a
+  calibrated schedule. Measured Qwen3-0.6B: adaptive (cheapest 14 layers at k=4)
+  40.83 ppl at 75% storage vs uniform k=6 48.05 at 75% and uniform k=r int8
+  19.36 at 50%. Per-layer damages are super-additive — truncation is a last
+  resort, int8 is the default. Repro: `benchmarks/bench_adaptive.py`.
+
+## Channel profile and sub-byte packing (1.1)
+
+- **Scale model.** The archive stores one fp32 scale per (block, frequency) row,
+  shared by all head_dim channels. Per-channel magnitudes differ by orders of
+  magnitude, so a *static* calibrated profile `g[freq, d]` folded into the step
+  (`step = scale * g`) cuts the reconstruction error at 8 bits (measured
+  0.0224 -> 0.0059 on K, 0.0094 -> 0.0065 on V), and is what makes 7-bit
+  usable. The profile is per (layer, stream) — K and V
+  profiles differ enough that sharing one table is *worse* than no table on V.
+  `FlashCodecLayer` therefore builds two codec instances; do not "share them for
+  tidiness".
+- **Calibration is offline and causal.** `calibrate_channel_scales` runs one
+  forward on 1-2k tokens; the table is a training-time constant, never derived
+  from the stream being decoded (that would break the causal invariant).
+- **Measured ppl (Qwen3-0.6B dense, 16x512 windows built from the repo's
+  markdown, disjoint 2048-token calibration, baseline 31.1504)**: b8 31.6745
+  (+0.524) -> b8+profile 31.1210 (-0.029) -> b7+profile 31.1750 (+0.025) at
+  45.3% -> b6+profile 31.3993 (+0.249) at 39.1%. Without the profile b7 is
+  +2.34 and b6 +16.05, b4 collapses (ppl 11336). Hybrid Qwen3.5-0.8B (6/24
+  layers, baseline 23.5318): b6+profile -0.010. Repro:
+  `benchmarks/bench_calibrated.py`.
+- **Bit packing** is an MSB-first contiguous stream, zero-padded to a byte
+  boundary so any head_dim works (`archived_dim(D) = ceil(D*bits/8)`). The cache
+  stores uint8 with that last dim; `head_dim` must be tracked on the stream
+  (`_CodecStream.head_dim`) because `_coeffs.shape[-1]` is no longer D. The
+  Triton kernel unpacks with a gather (`(b0<<8|b1) >> (16-p0-bits)`), which is
+  ~2x the cost of the plain int8 load at 64K — acceptable, but do not expect it
+  to be free.
+- **`storage.py` is a storage/transport codec, not a hot-path one.** It expands
+  packed coefficients back to int8 first (bit-shifted streams compress worse),
+  concatenates a stream's parts and zlibs them. Loading re-packs; pass
+  `device="cuda"` (CPU packing is ~40 Mval/s, GPU ~100x faster).
+
+## Model bundles (`flashcodec/export.py`, 1.2)
+
+- "Export a 7-bit model" means **the KV-cache tier**, not weight quantization:
+  the checkpoint is unchanged and a `flashcodec-kv.json` sidecar carries the
+  codec config + the per-layer, per-stream profiles (base64 fp32, ~313 KB for a
+  28-layer model). Do not describe it as a quantized checkpoint in docs — that
+  would be wrong and users would expect smaller weights.
+- `export_model(..., save_weights=False)` only references the base checkpoint;
+  `save_weights=True` writes a self-contained dir (weights + tokenizer +
+  manifest). `load_pretrained()` resolves `base_model` when weights are not
+  included.
+- `flashcodec.export` is imported lazily from `__init__` (`__getattr__`): an
+  eager import turns `python -m flashcodec.export` into a runpy double import.
+
+## MLA models (DeepSeek-V2/V3, measured on V2-Lite)
+
+- The cache holds `keys (B,1,S,kv_lora_rank)` (the compressed latent) and
+  `values (B,1,S,qk_rope_head_dim)` (the shared rope key) — head count 1, so the
+  codec sees head_dim 512 / 64 and compresses it unchanged. `expand_kv` rebuilds
+  per-head K/V from the reconstructed latent afterwards.
+- Measured (`benchmarks/bench_mla.py`, 27 layers, 8 x 512 windows): 7-bit +
+  profile 44.4% of the bf16 latent, ppl 15.2497 -> 15.2369; 6-bit + profile
+  15.3142; generated tokens identical. 4K decode step 954 ms raw vs 959 ms
+  compressed.
+- **Do not sell this as a large memory win**: the MLA latent is already ~7x
+  smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128)
+  and HF materializes the expanded keys/values every forward, so only the stored
+  cache shrinks. Same percentage as dense models, far fewer bytes.
+- The 16B checkpoint does not fit in 32 GB next to the CUDA context: export with
+  `--device-map auto` (accelerate; budgets 80% of free VRAM by default), or the
+  load tries to stage ~31 GB of weights on the host.
+
+## Negative results (measured; do not re-propose without new data)
+
+- **2D DCT across heads is useless.** At an equal coefficient budget (16 of 64)
+  on real KV: keep all heads + 2 time freqs gives cos 0.970/0.815/0.768
+  (layer 0 K / 14 V / 27 V); keep all time freqs + 2 head freqs gives
+  0.826/0.524/0.524. The compressible energy is on the seq axis only. Any 2D
+  scheme that truncates the channel/head axis loses.
+- **Cosine is a mirage.** k=8 b=4 measures cos 0.994 and ppl 11336; k=8 b=6
+  measures cos 0.9986 and ppl 43.3. Judge every quantizer change by ppl, never
+  by cosine.
+- **Entropy coding cannot go on the hot path.** Symbol entropy at 8 bits is
+  6.84/8 (K 6.32, V 7.36) — ~15% of the payload — but decoding it every step
+  costs more than it saves, and Huffman/ANS is serial. Disk only.
+- **NVDEC / real-JPEG decode**: works (nvJPEG, 2.07 Gpix/s via torchvision) but
+  a decode step needs 56 images (28 layers x K,V), 0.55 s encode + 0.11 s decode
+  at 4K vs 3.6 ms for the Triton coefficient path (~183x), ~2200x at 64K. The
+  codec is not a JPEG bitstream and making it one does not pay.
+- **V offload to host / "V as a video stream"**: dead on PCIe. Measured
+  (`benchmarks/bench_offload.py`, Gen4 x8, pinned H2D 10.7 GB/s): the decode
+  step is launch-bound (16.1 / 16.1 / 17.9 ms at 4K / 16K / 64K) while the V
+  transfer is linear (11.0 / 44.0 / 176.1 ms), so even a perfectly overlapped
+  copy gives 1.1x / 2.9x / 9.9x; NVDEC per step is 37 / 150 / 598 ms. There is
+  no crossover at longer contexts — the ratio is scale-invariant. Also, "V is
+  the tolerant stream" is a 4-bit phenomenon: at 7 bits V-only -0.050 ppl,
+  K-only -0.078, both +0.003. Keep V compressed in VRAM.
+
+## Design decisions (don't "refactor these away" in passing)
+
+- **The HF hot patch lives in the Cache layer, not the attention kernel**: KV
+  writes/reads in standard HF models converge on the Cache interface
+  (`update`/`key_cache`), so injecting a `CodecKVCache` duck type is enough — far
+  more robust than per-model surgery (GQA/MQA/RoPE variants).
+- **PNG dense storage honestly counts as 1.0**: anchor+deltas are the same size as
+  the original block; what it saves is information entropy (variance compression
+  ~30×), and that headroom is left to an entropy coder — `storage_ratio()` must not
+  "round" this into (r-1)/r.
+- A full `forward(seq)` prefill compresses complete blocks directly, so in-block
+  position attention sees the block-level reconstruction (intra-block
+  approximation); the incremental path has no such issue. This is documented
+  semantics, not a bug.
+- Archive data structure: **a capacity-doubling preallocated single tensor**
+  (std::vector style, starting at 16 blocks, doubling when full) — jpeg uses
+  `_coeffs (B,H,capacity,k,D)`; png uses `_deltas (B,H,capacity,r-1,D) fp32 +
+  _anchors (B,H,capacity,D)`. Each full block only does an in-place slice write;
+  `read()` decodes only the newly archived blocks (memoized `_rec`) and cats the
+  raw tail.
+  **Do not** revert to "append a new archive tensor per full block + loop over
+  archives in read" — with that fragmentation, per-token decoding measured 170×
+  slower reads (31ms → 0.18ms at S=4096, launch overhead dominating).
+  `storage_bytes()` only counts the logical valid region, not the free capacity
+  reserved by doubling. `reset()` zeroes the counters but **retains allocated
+  capacity** (reused for crop/refill VRAM).
+
+## Release
+
+- `images/` holds the README screenshots and is maintained by the user — do not
+  regenerate, replace, or commit new images unless explicitly asked.
+- `pyproject.toml` (setuptools, MIT, torch>=2.0); the version number is written in
+  `pyproject.toml`, `flashcodec/__init__.py::__version__` **and the top
+  `CHANGELOG.md` entry**, so changing one requires syncing all three
+  (`uv lock` afterwards: the lock records the project's own name/version).
+- **Distribution name is `flashcodec-kv`, import name is `flashcodec`**; the GitHub
+  repo is `aifeifei798/flashcodec-kv` (renamed from `flashcodec`; old URLs
+  redirect). The bare `flashcodec` name on PyPI is an unrelated 0.0.0 placeholder
+  package, never publish under it (rename only if the user confirms they own that
+  name).
+- `.github/workflows/ci.yml` runs the three codec tests plus the transformers
+  integration test on CPU (Python 3.10 / 3.12, `pip install -e ".[hf]"`).
+  `requires-python = ">=3.10"` is driven by transformers 5.20; don't lower it
+  without also making the `hf` extra conditional, or `uv lock` fails.
+- Before publishing to PyPI, run all four test groups + both benchmarks + 
+  `benchmarks/run_qwen_demo.py` (the measured tables in the README must be updated
+  accordingly — every number in the README was actually measured; no placeholders
+  or stale data), then `uv build`.
+- **1.x API is frozen**: `apply_flash_codec` / `remove_flash_codec`,
+  `apply_codec_attention` / `remove_codec_attention`, `FlashCodecCache`,
+  `FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
+  `codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`,
+  `channel_scale` / `channel_scale_v`, `calibrate_channel_scales`,
+  `save_archive` / `load_archive`, `export_model` / `load_pretrained` /
+  `read_manifest` / `apply_export`. Add options with defaults; breaking changes
+  need a 2.0.
+
+
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+The import name is always `flashcodec`; the PyPI distribution is
+`flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
+placeholder package).
+
+## [1.1.0] - 2026-11-05
+
+### Added
+
+- **Calibrated channel profile** (`JPEGCodec(channel_scale=...)`,
+  `calibrate_channel_scales(model, input_ids)`): one static
+  `(keep_freqs, head_dim)` table per layer *and stream*, folded into the
+  quantizer step (`step = scale[block, freq] * profile[freq, d]`). The table is
+  a constant, so decode pays one broadcast multiply. Measured on Qwen3-0.6B
+  (16 x 512-token windows built from the repository's own markdown, profile
+  calibrated on a disjoint 2048-token slice, baseline ppl 31.1504):
+
+  | tier | ppl | dppl | of bf16 |
+  |---|---|---|---|
+  | k=8 b=8 | 31.6745 | +0.524 | 51.6% |
+  | k=8 b=8 + profile | 31.1210 | -0.029 | 51.6% |
+  | k=8 b=7 | 33.4916 | +2.341 | 45.3% |
+  | **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
+  | k=8 b=6 | 47.2046 | +16.05 | 39.1% |
+  | k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+
+  Hybrid Qwen3.5-0.8B (6/24 layers carry a codec, baseline 23.5318): b=7 +
+  profile +0.015, b=6 + profile -0.010. Without the profile, b=6/b=4 stay
+  catastrophic on the dense model (+16.05 / ppl 11336 for b=4).
+  Reproduce: `benchmarks/bench_calibrated.py`.
+- **Sub-byte coefficient packing** (`quant_bits` 2..8): contiguous MSB-first
+  bit stream, byte-padded so any head_dim works; unpacked on the fly by both
+  the torch path and the Triton split-K kernel (gather-based, no extra pass).
+- **`save_archive` / `load_archive`** (`flashcodec/storage.py`): the storage /
+  transport entropy coder. Packed coefficients are expanded back to int8 before
+  compression (bit-shifted streams compress worse), one zlib blob per stream,
+  zstd when importable. 28-layer Qwen3-0.6B, 4001 tokens, k=8 b=7 + profile:
+  208.0 MB in memory -> 181.6 MB on disk (76.7% of the logical payload, 39.6%
+  of the bf16 KV), bitwise round trip; save 5.0 s, load 13.2 s on CPU /
+  1.46 s with `device="cuda"`.
+- `tests/test_calibrated_bits.py` and `tests/test_storage.py` (both in CI).
+
+### Changed
+
+- `JPEGCodec.storage_ratio()` accounts for the bit depth.
+- `FlashCodecLayer` / `FlashCodecCache` / `CodecKVCache` accept `channel_scale`
+  and `channel_scale_v`; per-layer tables are passed through `per_layer=`.
+- `FlashCodecLayer` builds separate key/value codec instances (they are
+  stateless — this is what makes per-stream profiles possible without changing
+  the archive layout).
+- Decode cost at 64K (B=1, H_kv=8, H_q=16, D=128, k=8, per layer): b=8
+  0.371 ms, b=8 + profile 0.414 ms, b=7 + profile 0.767 ms (the gather unpack
+  is ~2x the plain int8 load; still far below the materialized path).
+
+## [1.2.0] - 2026-11-05
+
+### Added
+
+- **Model bundles** (`flashcodec/export.py`): `export_model()` calibrates a
+  checkpoint once and writes a `flashcodec-kv.json` sidecar holding the codec
+  tier and the per-layer / per-stream channel profiles (base64 fp32);
+  `load_pretrained()` and `apply_export()` restore them, so a 7-bit KV cache is
+  active right after loading. Weights are untouched — this exports the
+  *KV-cache* tier, not weight quantization. CLI:
+  `flashcodec-export` / `python -m flashcodec.export`, plus `--inspect`.
+  Measured on Qwen3-0.6B, 2048-token calibration: bundle 313 KB for 28 layers,
+  45.3% of bf16 KV, and the generated tokens are identical to the uncompressed
+  model on the same prompt.
+- `tests/test_export.py` (CI): manifest round trip, profile reload, patched
+  generation, storage ratio.
+
+## [Unreleased]
+
+### Added
+
+- `benchmarks/bench_mla.py`: flashcodec on an MLA model, measured on the real
+  DeepSeek-V2-Lite checkpoint (cache = 512-d latent + 64-d rope key per
+  token/layer, 27 layers). 7-bit + profile is 44.4% of the bf16 latent cache,
+  ppl 15.2497 -> 15.2369 (6-bit + profile 15.3142), generated tokens identical.
+  Decode step at 4K: 954 ms raw vs 959 ms compressed, because `expand_kv`
+  materializes the per-head keys/values on every forward regardless.
+- `export_model` / `load_pretrained` take `device_map` / `max_memory`, and the
+  CLI gains `--device-map auto` / `--max-gpu-gib`, so 16B-class checkpoints can
+  be calibrated with layers spilling to host RAM (needs `accelerate`).
+- `benchmarks/bench_offload.py`: measures whether V can live on host RAM / a
+  video stream. Warm pinned H2D is 10.7 GB/s (Gen4 x8); the decode step is
+  launch-bound (16.1 -> 17.9 ms from 4K to 64K) while the V transfer grows
+  linearly (11.0 / 44.0 / 176.1 ms), so the best-case pipelined step is
+  1.1x / 2.9x / 9.9x, and NVDEC-per-step is 37 / 150 / 598 ms. `--kv-split`
+  also shows there is no K/V tolerance asymmetry at 7 bits (V-only -0.050
+  ppl, K-only -0.078, both +0.003). README gains a matching "why not offload"
+  section in both languages; no code or API change.
+
+### Changed
+
+- `export_model` / `load_pretrained`: `trust_remote_code` support, calibration
+  clamped to the model's `max_position_embeddings`, and a clear error when a
+  model exposes no KV-cache layers. `--inspect` now prints the storage ratio for
+  the bundle's actual `head_dim`. Verified on the hybrid Qwen3.5-0.8B (6/24
+  codec layers, 133 KB, token-identical generation).
+
+### Documentation
+
+- `docs/llama-cpp-kv-quantization.md`: measured same-bytes comparison against
+  llama.cpp's KV quantization on Qwen3-0.6B (llama.cpp `184f65360`). Verdict:
+  `-ctk q8_0` is ~free at 53% of fp16 bytes, while both usable flashcodec tiers
+  lose at equal bytes (truncation needs 2.7× the bytes for the same damage;
+  lossless basis + int8 is 8× worse at 50%). Also records the K/V asymmetry
+  behind the recommended `K=q8_0 + V=q4_0` (40.6% of fp16, +0.28% ppl) and why
+  4-bit K is the only cliff. README gains a matching section and Boundaries
+  bullet; no code or API change.
+- Same doc, §3: stacking the codec **on top of** llama.cpp's own KV
+  quantization (64 × 512 wikitext windows). On `q8_0` the codec reclaims 0.8%
+  (K) / 1.6% (K+V) of the bytes while the damage grows 1.6–2.3×; on `q4_0` a
+  lossless-basis int8 archive is *larger* than the 4-bit payload it replaces
+  (39.8% vs 28.1%). Truncation on top of either quantizer stays catastrophic:
+  the two compression stages are not complementary.
+- Same doc, §5: the coefficient-domain quantizer flips the result. Giving the
+  DCT coefficients ggml's per-32 absmax (lossless basis, identical byte count)
+  instead of this library's per-frequency-row scale reduces the perplexity
+  damage 5× at 8 bits (fp16, 1024-token windows: +0.028 vs +0.138) and 7× at
+  4 bits (ppl 41.6 vs 186.8) with the *reconstruction error unchanged* — the
+  transform shapes the error into the slowly-varying subspace that softmax
+  barely sees. HF-measured, not yet confirmed in llama.cpp; 4-bit K remains
+  unusable on this model.
+- Same doc, §6: the 4-bit cliff is a *small-model* property. On a local 27B
+  hybrid (DrakIdol Qwen3.8-27B-Plus Q4_K, `qwen35`, 17 KV-bearing layers),
+  `q4_0` KV costs +0.19% at 512 ctx, +0.39% at 8k and +0.20% at 32k (CIs
+  ±0.06–0.10), where the 0.6B costs +236%. So the §5 win lives where the model
+  is already broken: a mechanism result, not a deployment feature. Gemma4-12B is
+  dense but has a 302 perplexity on wikitext (roleplay finetune), so its deltas
+  are not usable without an in-domain corpus.
+- Same doc, §7: Gemma4-12B (`gemma4`, 48 layers = 40 SWA@1024 + 8 global MQA)
+  measured with `--kl-divergence` because its perplexity is not a valid metric
+  (baselines 302 / 355 / 2.24 / 18.87 across corpora; quantization sometimes
+  *lowers* ppl). Mean KL: 0.168 at `q8_0`, 0.230 (`q4_0` K), 0.225 (`q4_0` V),
+  0.303 at `q4_0` K+V, top-1 agreement 89.1%. No cliff at 12B, but 4-bit is not
+  free either. K and V contribute equally in KL even though ppl blames V 2×.
+  Same protocol on the 27B hybrid: KL 0.0021 (`q8_0`) / 0.0035 (`q4_0`) — 86×
+  less distortion, because only 17 of its 64 layers read a KV cache.
+- Same doc, §8: HF-side KL pre-judgment across three models (mean KL(tier||f16),
+  top-1 agreement, 8192 scored tokens, equal-byte pairs). The transform helps
+  only where row quantization is already destructive — Qwen3-0.6B: KL 0.0168 ->
+  0.0056 at 8 bits, 2.375 -> 1.028 at 4 bits — and is neutral at 8 bits (0.0002
+  -> 0.0003) with **worse** 4-bit (0.0364 -> 0.0968) on Hy-MT2-1.8B, and neutral
+  (0.0025 -> 0.0028) with worse 4-bit (0.279 -> 0.330) on Gemma4-E2B. Verdict:
+  no operating point where the codec is worth shipping, so no llama.cpp
+  implementation follows.
+- Same doc, §8: adds a **plain dense Qwen3-8B** (36 layers, 8 KV heads, no SWA /
+  hybrid / MQA) as the decisive row — the architecture the codec was designed
+  against. `q8_0` KL 0.0009 / top-1 99.2% -> dct+q8 0.0005 / 99.1% (both
+  negligible); `q4_0` 0.0802 -> dct+q4 0.0852 (6% worse); at the operating point
+  that matters, `q8_0` K + `q4_0` V (40.6% bytes), KL is 0.0047 raw vs 0.0045
+  with DCT on K (top-1 97.3% vs 97.2%), i.e. the transform is a no-op while
+  spending the 4 bits on V instead of K is worth 10x. K is again ~18x more
+  sensitive than V, so the K/V asymmetry is architectural, not a size effect.
+- README.md / README.zh-CN.md: new top-level "research note" section stating the
+  negative result up front (what was tested, the equal-byte table, the operating
+  point where the transform is a no-op, and the conclusion that it is not
+  implemented in llama.cpp), linking to the full doc.
+- Same doc, appendix: why the original "JPEG for weights" idea needs a rotation
+  rather than coefficient truncation (weights have no autocorrelated axis and a
+  flat trained spectrum; the measured KV analogue is that truncation costs 2.7x
+  the bytes of block quantization for the same damage), plus the one-afternoon
+  comparison that would settle it. The appendix also states the two conditions
+  the JPEG analogy needs — energy concentration (`Var(Δ)/Var(X) = 2(1−ρ)`, i.e.
+  ρ ≈ 0.64–0.92 for text K vs ρ ≈ −0.07–0.82 for V) and a non-adaptive baseline
+  quantizer (ggml's per-32 absmax is already an adaptive table) — and why the
+  damage sits along `head_dim` rather than in the frequency domain, making a
+  rotation there (QuaRot/SpinQuant/`hdmd`) the correct form of the same idea.
+
+## [1.0.0] — 2026-10-23
+
+First stable release. The public surface is frozen for the 1.x line (breaking
+changes need a 2.0); the research caveats in the README's *Boundaries* still
+apply, and every number in the README is measured.
+
+### What 1.0 covers
+
+- **Codecs**: `jpeg` (blockwise DCT-II, keep k of r, optional int8 coefficients
+  with per-(block, frequency) scales) and `png` (anchor + first-order deltas,
+  bitwise lossless at `keep_ratio=1.0`).
+- **Caches**: `CodecKVCache` (standalone, no transformers) and
+  `FlashCodecCache` / `FlashCodecLayer` (native `transformers` 5.x Cache
+  backend, hybrid architectures via `from_config`, per-layer budgets).
+- **Integration**: `apply_flash_codec` / `remove_flash_codec` hot patch; beam
+  search (`reorder_cache`), exact `crop`, memoized `read()`.
+- **Decode attention**: coefficient-domain `codec_decode_attention` (no KV view)
+  plus the Triton split-K kernel, wired into `generate` with
+  `materialization_free=True` for standard Llama/Qwen/Qwen3.5 attention.
+- **Benchmarks**: `bench_reconstruct`, `bench_vram` (CUDA-event timed),
+  `bench_attention`, `bench_e2e`, `bench_ppl`, `bench_adaptive`,
+  `run_qwen_demo`.
+- **Demo**: five tiers, materialization-free toggle, and a full per-tier
+  comparison (storage / speed / memory / continuation NLL / token match).
+
+### Stability
+
+The 1.x public API: `apply_flash_codec`, `remove_flash_codec`,
+`apply_codec_attention`, `remove_codec_attention`, `FlashCodecCache`,
+`FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
+`codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`. New options
+are additive; existing signatures keep their defaults.
+
+Published to PyPI as [`flashcodec-kv` 1.0.0](https://pypi.org/project/flashcodec-kv/)
+(import name stays `flashcodec`).
+
+## [0.6.1] — 2026-10-23
+
+### Fixed
+
+- **`materialization_free=True` on Qwen3.5**: its attention uses a Q-gate
+  (`q_proj` emits query + gate, and the attention output is scaled by
+  `sigmoid(gate)` before `o_proj`). The wrapper now handles that layout and
+  guards on `head_dim` / `o_proj` width, falling back to the original forward for
+  anything that does not match (no more shape errors on hybrid models).
+
+### Changed
+
+- Demo comparison is much more detailed: five tiers (png lossless, jpeg k=8
+  int8, k=4, k=2, k=2 int8), a materialization-free toggle, and a "Full
+  comparison" tab that reports per tier — KV footprint vs raw, archive/view
+  split, decode tok/s, peak/steady memory, continuation NLL (perplexity-style)
+  and token match, with storage/speed/NLL bars.
+
+## [0.6.0] — 2026-10-23
+
+### Added
+
+- **Triton split-K kernel for coefficient-domain decode attention**
+  (`flashcodec/triton_attention.py`, flash-decoding style): block chunks write
+  partial (max, sum, acc), a combine kernel merges them. Dequantization, scoring,
+  online softmax and the output accumulation happen in registers, so no
+  intermediate tensors are allocated. One layer at 64K (`jpeg k=2 int8`,
+  B=1, H_kv=8, H_q=16, D=128): materialized 0.89ms/520MB → torch coefficient
+  0.43ms/96MB → **Triton 0.17ms/0MB**.
+- `codec_decode_attention(..., impl="auto"|"torch"|"triton")`; auto picks Triton
+  on CUDA and falls back for png / CPU / D>256 / empty archives.
+  `do_not_specialize` on the dynamic scalars avoids per-step recompilation.
+- End-to-end (Qwen3-0.6B, 4096-token prompt + 32 new): steady KV memory
+  1535MB → 122MB (12.6×) at 40.3 tok/s vs 44.2 materialized (was 30.7 before the
+  kernel); per decode step 22.8ms vs 21.7ms materialized / 17.8ms raw.
+- `tests/test_attention.py` covers Triton-vs-torch agreement and dtype.
+
+## [0.5.0] — 2026-10-23
+
+### Added
+
+- **HF integration for materialization-free decode**:
+  `apply_flash_codec(..., materialization_free=True)` wraps standard
+  Llama/Qwen-style attention forwards so decode steps attend on the stored rows
+  (projection + RoPE unchanged, guarded to batch-1 / single-token / eval /
+  non-sliding layers, silent fallback otherwise). The prefill view is dropped on
+  the first decode step. `remove_flash_codec` restores everything;
+  `codec_attention_stats(model)` reports the wrapped module count.
+- `benchmarks/bench_e2e.py`: long-context end-to-end benchmark (speed, peak and
+  steady memory). Qwen3-0.6B, 4096-token prompt + 32 new tokens:
+  baseline 53.2 tok/s / peak 581MB; codec k=2 int8 materialized 44.9 tok/s /
+  steady 1535MB; materialization-free 30.7 tok/s / peak 642MB / steady 122MB
+  (12.6× less steady memory, ~1.7× slower decode).
+- `tests/test_hf_integration.py` covers the patched generate path (lossless tier
+  still token-identical, no reconstruction view retained, clean removal).
+
+## [0.4.0] — 2026-10-23
+
+### Added
+
+- **`flashcodec/attention.py` — materialization-free decode attention.** Both
+  codecs are linear along the seq axis (`K_block = A @ S`), so a decode query
+  can attend on the stored rows: `q·K[p] = (q·S^T) @ A[p]` and
+  `out = (prob @ A) @ S`. Measured at 64K with jpeg k=2 int8: 0.86ms / 520MB
+  (materialized) → 0.46ms / 128MB (coefficient domain), maxdiff ≤ 1e-6.
+  Decode only; png is numerically supported but has no memory win.
+- **`per_layer` budgets** on `FlashCodecCache.from_config`, plus
+  `benchmarks/bench_adaptive.py` (per-layer sensitivity calibration).
+  Measured on Qwen3-0.6B: adaptive 40.83 ppl at 75% storage vs uniform k=6
+  48.05 at 75% and k=r int8 19.36 at 50% — calibration helps over uniform
+  truncation, but int8 remains the default because the damages are
+  super-additive.
+- `tests/test_attention.py` and a `benchmarks/bench_attention.py` memory/latency
+  benchmark.
+
+## [0.3.0] — 2026-10-23
+
+### Added
+
+- **`quant_bits=8` for the jpeg codec**: coefficients are stored as int8 with a
+  per-(block, frequency) fp32 scale. A real byte-level saving on top of the
+  `k/r` geometric ratio: 6.6% of fp32 raw KV at k=2, ~52% of bf16 raw KV at
+  k=8 (full lossless DCT basis) with +2% perplexity on a dense model.
+- **`benchmarks/bench_ppl.py`**: perplexity evaluation on a local corpus, run
+  against a dense model (Qwen3-0.6B) and a hybrid one (Qwen3.5-0.8B).
+- **Honest measurement fixes**: `bench_vram --cuda` now uses CUDA events plus a
+  warmup (the old numbers were async and meaningless), and `run_qwen_demo`
+  reports tokens/s and peak memory.
+- README (EN/ZH): real-KV statistics and perplexity tables.
+
+### Changed
+
+- README claims about autocorrelation and "30× variance compression" are now
+  qualified with measured real-model statistics; the dense-model caveat
+  (coefficient truncation compounds per layer) is documented, with
+  `k = r + quant_bits=8` as the safe tier for fully compressible models.
+
+## [0.2.0] — 2026-10-23
+
+### Added
+
+- **Beam search support**: `FlashCodecLayer` / `CodecKVCache` implement
+  `reorder_cache`, `batch_repeat_interleave` and `batch_select_indices` over
+  the archives *and* the raw tail. On the lossless tier (`png keep_ratio=1.0`)
+  `generate(num_beams>1)` is bitwise-identical to the unpatched model.
+- **Exact `crop`** for speculative decoding: archived blocks are kept verbatim
+  and only the boundary partial block returns to the raw tail, so repeated
+  crops no longer re-compress the history (the old rebuild-from-view path added
+  loss on every crop).
+- **Memoized `read()`**: decoded archive blocks land in an append-only
+  reconstruction buffer, so a decode step decodes one new block instead of the
+  whole history (`bench_vram` S=64K, jpeg k=2: 38.7ms → 5.2ms).
+
+### Changed
+
+- Distribution renamed to `flashcodec-kv` (import name unchanged) because the
+  `flashcodec` name on PyPI is taken by an unrelated placeholder package. The
+  GitHub repository moved to
+  [aifeifei798/flashcodec-kv](https://github.com/aifeifei798/flashcodec-kv)
+  (the old URL redirects).
+- Four new regression tests: memoized read vs one-shot decode, exact and
+  repeatable crop, beam-search batch gather, and beam search / crop parity
+  against the unpatched model.
+
+### Fixed
+
+- README numbers that had gone stale: the Qwen3.5-0.8B table now matches a
+  fresh `benchmarks/run_qwen_demo.py` run (jpeg k=2 → 32.3% storage / 38.1%
+  token match, jpeg k=4 → 54.8% / 49.2%, png lossless → 1.8× with bitwise
+  identical tokens), and the CPU latency table reflects the memoized read.
+
+## [0.1.0] — 2026-10-23
+
+### Added
+
+- Initial release: JPEG-style blockwise DCT-II codec (`mode="jpeg"`, keep the
+  lowest K coefficients) and PNG-style anchor + first-order-delta codec
+  (`mode="png"`, lossless at `keep_ratio=1.0`).
+- `CodecKVCache` (standalone, duck-typed as a cache), `FlashCodecCache` /
+  `FlashCodecLayer` (first-class `transformers` 5.x Cache backend, hybrid
+  architectures handled through `from_config`), and `apply_flash_codec` /
+  `remove_flash_codec` one-line hot patch.
+- Causal-safety guarantees (complete blocks only; archived tensors are never
+  rewritten), capacity-doubling preallocated archive storage, benchmarks
+  (`bench_reconstruct`, `bench_vram`, `run_qwen_demo`) and the Gradio
+  side-by-side demo.
+
+
+# Same-bytes comparison with llama.cpp KV quantization
+
+Measured 2026-10-23 on **Qwen3-0.6B** (28 layers, 8 KV heads, head_dim 128, i.e.
+112 KiB of KV per token in fp16), RTX 5090 D, llama.cpp `184f65360`
+(CUDA + flash-attention enabled), wikitext-2-raw.
+
+## TL;DR
+
+llama.cpp's own `-ctk q8_0` reaches **~53% of fp16 KV bytes at +0.05% perplexity**.
+Two usable flashcodec **archive** tiers lose against it at equal bytes:
+
+| flashcodec tier | bytes | damage at equal bytes vs `q8_0` |
+|---|---|---|
+| truncation (`k < r`) | 25–75% | **2.7× more bytes for the same damage**; `k=2` is unusable |
+| lossless basis + `quant_bits=8` | 50% | **8× more damage** (+0.38% vs +0.05%) |
+
+Stacking the codec on top of llama.cpp's quantizer does not help either: on
+`q8_0` it reclaims 0.8% of the bytes for 63% more damage (§3).
+
+**But the loss is the coefficient quantizer, not the transform.** The archive
+above stores one fp32 scale per frequency row (128 values). Give the coefficients
+the same per-32 absmax that ggml uses — identical bytes — and the ordering flips:
+**5× less perplexity damage at 8 bits and 7× less at 4 bits (§5)**, with the
+*reconstruction error unchanged*. The gain is error shaping (the error lands in
+the slowly-varying subspace, which softmax barely sees), not a better K. That
+result is HF-measured and still needs confirming inside llama.cpp; it does not
+make 4-bit K usable on this model (ppl 41.6 vs 18.6).
+
+**Scale check.** On a 27B hybrid (`qwen35`, 17 KV-bearing layers) the same
+`q4_0` KV config costs +0.39% at 8k context and +0.20% at 32k — the small-model
+cliff (+236% on 0.6B) does not exist at production scale (§6), and the 4-bit KL
+there is 0.0035, so there is nothing to fix. On the 0.6B it is already broken.
+Both ends leave the transform without a job; only the dense mid-size case was
+still open, and §8 closes it.
+
+**Dense mid-size models are where 4-bit KV is costly but not fatal** — and where
+perplexity stops working as a metric. Gemma4-12B (48 layers, 40 SWA + 8 global
+MQA) measured with `--kl-divergence`: KL 0.17 at 8 bits, 0.30 at 4 bits, top-1
+agreement 89%. Its ppl ranges from 2.2 to 355 depending on the corpus and
+sometimes *improves* under quantization, so KL is the only usable metric there.
+
+**But the HF-side KL pre-judgment kills the follow-up** (§8): at equal bytes the
+transform helps only where row quantization is already destructive
+(Qwen3-0.6B: 3× lower KL at 8 bits), is neutral at 8 bits / slightly worse at
+4 bits on Hy-MT2-1.8B and Gemma4-E2B, and on a **plain dense Qwen3-8B** — the
+most favourable case — it changes nothing at the operating point that matters
+(`q8_0` K + `q4_0` V, 40.6% bytes: KL 0.0047 raw vs 0.0045 with DCT on K) while
+being 6% worse at 4 bits on both sides. There is no operating point where it is
+worth shipping, so **no llama.cpp integration follows from this**.
+
+Finally, K and V are not equally sensitive, which changes how a KV budget should
+be spent.
+
+## 1. llama.cpp KV types (the target to beat)
+
+`llama-perplexity -c 512 --chunks 40 -fa on -ngl 99`, perplexity:
+
+| K | V | ppl | Δ vs f16 | B/token | of fp16 |
+|---|---|---|---|---|---|
+| f16 | f16 | **19.6037** | — | 114,688 | 100% |
+| q8_0 | q8_0 | 19.6138 | +0.05% | 60,928 | 53.1% |
+| q8_0 | f16 | 19.6141 | +0.05% | 87,808 | 76.6% |
+| f16 | q8_0 | 19.6080 | +0.02% | 87,808 | 76.6% |
+| q8_0 | q4_0 | 19.6579 | +0.28% | 46,592 | 40.6% |
+| f16 | q4_0 | 19.6606 | +0.29% | 73,472 | 64.0% |
+| q4_0 | f16 | 66.0552 | +237% | 73,472 | 64.0% |
+| q4_0 | q8_0 | 66.5416 | +239% | 46,592 | 40.6% |
+| q4_0 | q4_0 | 65.8321 | +236% | 32,256 | 28.1% |
+
+Throughput (`llama-bench -p 4096 -n 32 -fa 1`, 3 reps):
+
+| KV | pp4096 t/s | tg32 t/s |
+|---|---|---|
+| f16 | 68,121 | 713.7 |
+| q8_0 | 61,857 | 610.5 |
+| q4_0 | 62,022 | 610.7 |
+
+Two asymmetries worth remembering:
+
+- **4-bit K is the only cliff**: K alone at `q4_0` gives 66.06 (+237%), while V
+  alone at `q4_0` costs +0.29%. If a KV budget has to be squeezed,
+  `K=q8_0 + V=q4_0` is the cheap end point (40.6% of fp16, +0.28% ppl).
+- 8-bit is free on both sides, so the *only* open design space in llama.cpp is
+  K below 4 bits — precisely where the codec is weakest.
+
+## 2. Same-bytes A/B: seq-axis DCT vs row-wise quantization
+
+Same model, `transformers` 5.x, bf16, 64 × 512-token wikitext windows.
+`q8_0 emul` = symmetric absmax quantization per 32 contiguous head dims
+(llama.cpp semantics, not bit-exact). `dct` = this project's blockwise DCT-II
+along the sequence axis, K-only or K+V.
+
+| tier | ppl | Δ | of fp16 |
+|---|---|---|---|
+| baseline | 27.9690 | — | 100% |
+| q8_0 K+V | 28.2485 | +1.00% | 53.1% |
+| q8_0 K only | 27.9823 | **+0.05%** | 76.6% |
+| dct b32 k32 int8 K only | 28.0750 | +0.38% | 75.8% |
+| dct b16 k16 int8 K only | 28.1194 | +0.54% | 75.8% |
+| dct b8 k8 int8 K only | 28.3300 | +1.29% | 75.8% |
+| dct b8 k8 int8 K+V | 28.3241 | +1.27% | 51.6% |
+| dct b8 k=4 K only | 172.26 | +516% | 75.0% |
+| dct b8 k=4 K+V | 649.6 | +2222% | 50.0% |
+| dct b8 k=2 K only | 3142 | +11100% | 62.5% |
+| dct b8 k=2 K+V | 21257 | +75900% | 28.1% |
+
+Absolute perplexities in the two tables are not comparable (HF runs disjoint
+windows in bf16, llama.cpp runs contiguous chunks in fp16); only the relative
+damage is.
+
+## 3. Stacking the codec on top of llama.cpp's quantization
+
+If llama.cpp already stores quantized KV, the natural follow-up is whether the
+codec can compress *those* values further. Same harness (64 × 512 wikitext
+windows): the row quantizer runs first, the codec sees the dequantized rows, and
+the byte count is the codec archive alone — the quantized values are replaced,
+not stored twice.
+
+| stack | ppl | Δ vs f16 | of fp16 |
+|---|---|---|---|
+| f16 | 27.9690 | — | 100% |
+| `q8_0` K+V | 28.2485 | +1.00% | 53.12% |
+| `q8_0` + dct b32/k32 int8 on K | 28.4259 | +1.63% | 52.34% |
+| `q8_0` + dct b8/k8 int8 on K | 28.5795 | +2.18% | 52.34% |
+| `q8_0` + dct b8/k8 int8 on K+V | 28.6244 | +2.34% | 51.56% |
+| `q8_0` + dct b8/k4 on K | 160.59 | +474% | 51.56% |
+| `q8_0` + dct b8/k2 on K | 2763.8 | +9781% | 39.06% |
+| `q4_0` K+V | 201.95 | +622% | 28.12% |
+| `q4_0` + dct b8/k8 int8 on K | 211.70 | +657% | 39.84% |
+| `q4_0` + dct b8/k4 on K | 1195.1 | +4173% | 39.06% |
+| `q4_0` + dct b8/k2 int8 on K | 5831.6 | +20751% | 20.51% |
+| `q4_0` + dct b8/k2 int8 on K+V | 42085 | +150371% | 12.89% |
+
+Reading:
+
+- **On top of `q8_0` the codec can only reclaim the scale overhead** — one
+  fp32 scale per 128 coefficient values instead of one fp16 scale per 32 raw
+  values. That is 0.78% of the total bytes on K (52.34% vs 53.12%) and 1.56% on
+  K+V, while the damage grows 1.6–2.3×. Strictly dominated.
+- **On top of `q4_0` it is worse than useless.** An int8 coefficient archive is
+  ~1 B/value, i.e. *larger* than the 0.5625 B/value it replaces, so the
+  lossless-basis stack actually costs **more** bytes (39.84% vs 28.12%) for a
+  worse model. Only aggressive truncation gets back under 4 bits, and those rows
+  (20.5% at ppl 5831, 12.9% at ppl 42085) are broken models, not compressions.
+- **The two stages are not complementary.** Both spend the same budget on the
+  same information (K), and llama.cpp's per-32 absmax is already the cheaper way
+  to spend it; putting an orthonormal transform in front only moves the error
+  around and adds a second source of it.
+
+The base quantizer here is an emulation in bf16 (symmetric absmax per 32 head
+dims, applied to K and V), so its absolute damage is harsher than the real
+`-ctk q8_0` (+1.0% vs +0.05% in §1: the emulation also quantizes V, which the
+real configuration does not). The ordering, and every byte count, is what the
+argument rests on.
+
+## 4. Why the codec loses
+
+1. **Truncation deletes variance, quantization only adds noise.** `dct k=4`
+   (half the coefficients kept, 75% of fp16 K bytes) damages as much as
+   `q4_0` (28% of fp16 K+V bytes). Attention logits are far more sensitive to a
+   missing subspace than to a bounded perturbation. `k=2` is not a compression
+   trade-off, it is a broken model. This matches the dense-model rows already in
+   the README's perplexity table (16.8 → 470 → 6486), so it is not a
+   llama.cpp-specific artifact.
+2. **The gain from the basis is "decorrelate, then quantize" — and row
+   quantization already has it.** Enlarging the block monotonically helps
+   (b8 +1.29% → b16 +0.54% → b32 +0.38%), which is the signature of
+   decorrelation, not of truncation. But ggml's per-32 absmax scale adapts
+   locally every 32 values, while this codec stores one scale per
+   (block, frequency) — i.e. one per 128 values. Larger blocks converge toward a
+   global transform; they do not overtake the per-32 scale.
+3. **K and V are not interchangeable.** V tolerates 4-bit almost for free; K
+   does not even tolerate it at 8-bit-plus-margin. Compressing both with the
+   same codec (which is what `FlashCodecCache` does) is therefore the wrong
+   shape of design. This is the same conclusion that llama.cpp's DeepSeek-V4
+   cache encodes structurally: `llama_kv_cache_dsv4` keeps a **compressed K-only**
+   tier and leaves V alone.
+
+## 5. Where the transform does win: the same quantizer on coefficients
+
+> **v1.1 update.** The mismatch below — one fp32 scale per 128 coefficients vs
+> ggml's per-32 absmax — is addressed in the archive itself by the calibrated
+> channel profile (`JPEGCodec(channel_scale=...)`): a static
+> `(keep_freqs, head_dim)` table folded into the step, per layer and stream.
+> Measured effect at an identical byte count: up to ~4x lower reconstruction
+> error on K (~1.4x on V) at 8 bits, and a 7-bit archive that costs +0.025 ppl (vs +2.34 uncalibrated) on
+> Qwen3-0.6B. The analysis below is kept as-is because it isolates the *error
+> shaping* effect of the transform, which the profile does not change.
+
+§2–§4 tested flashcodec's *own* archive format, whose coefficient quantizer
+stores one fp32 scale per (block, frequency) row, i.e. one per 128 values. That
+is coarser than ggml's per-32 absmax. Feeding the same per-32 quantizer to the
+coefficients instead (lossless basis, `k = r`, so the byte count is **identical**
+to the same ggml type on raw rows) flips the result:
+
+fp16 model, 1024-token windows scored on the last 512 (baseline ppl 18.59, close
+to llama.cpp's 19.60):
+
+| tier | ppl | Δ | of fp16 |
+|---|---|---|---|
+| f16 | 18.5913 | — | 100% |
+| `q8_0` K+V (raw rows) | 18.7294 | +0.1382 | 53.12% |
+| dct b8 + q8 K, q8 V | 18.6501 | +0.0588 | 53.12% |
+| dct b16 + q8 K, q8 V | 18.6282 | +0.0369 | 53.12% |
+| **dct b32 + q8 K, q8 V** | **18.6192** | **+0.0279** | **53.12%** |
+| `q4_0` K+V (raw rows) | 186.83 | +168.24 | 28.12% |
+| dct b16 + q4 K, q4 V | 64.33 | +45.74 | 28.12% |
+| dct b32 + q4 K, q4 V | 47.83 | +29.24 | 28.12% |
+| dct b32 + q4 K, q4 V (K only dct) | 41.61 | +23.01 | 28.12% |
+
+At **identical bytes**: 5× less perplexity damage at 8 bits, and 7× less at
+4 bits. Replicated on disjoint 512-token windows (`q8_0` +0.3595 vs
+dct b32 +0.0536; `q4_0` 196.3 vs 46.8). Block 32 > 16 > 8 in both regimes.
+
+### It is error shaping, not better reconstruction
+
+Measured on real K rows (Qwen3-0.6B, layer 0/6/12/18/24), the **reconstruction
+error is the same** for both quantizers:
+
+| variant | rel-L2 | max abs err |
+|---|---|---|
+| raw q8 | 0.0111–0.0124 | 0.17–1.70 |
+| dct b32 + q8 | 0.0110–0.0118 | 0.19–1.65 |
+
+So the transform does not preserve K better; it moves the quantization error
+into the low-frequency (slowly varying along positions) subspace. A logit offset
+that is nearly constant across neighbouring positions is close to invisible to
+softmax — only the error that changes the *relative* ordering of positions
+costs perplexity. Hence the same L2 error and a much smaller ppl cost, and hence
+also why larger blocks (finer frequency resolution) keep improving the result.
+
+### What this does and does not change
+
+- It **does not** rescue 4-bit: ppl 41.6 vs 18.6 is still a broken model, even
+  though the damage is 7× smaller than `q4_0`.
+- It **does** mean the seq-axis transform is a legitimate quantizer front-end
+  (coefficient-domain steps matched to frequency), not just a truncation scheme.
+  At 8 bits the absolute headroom is small because `q8_0` is already nearly
+  free, so the value only shows up in regimes where the byte budget is tighter.
+- It is measured in HF, not in llama.cpp, and this harness's absolute damage is
+  larger than llama.cpp's real `q8_0` (+0.74% vs +0.05% at a comparable
+  baseline). A llama.cpp implementation is needed before quoting it as a win
+  there; a larger model is needed before claiming it makes 4-bit K usable.
+
+## 6. Model size: the cliff is a small-model property
+
+The same KV-type sweep on a production-scale local checkpoint — DrakIdol
+Qwen3.8-27B-Plus, GGUF `Q4_K`, arch `qwen35`, 64 layers with
+`full_attention_interval = 4` (17 KV-bearing layers), 4 KV heads × 256 dim,
+i.e. 68 KiB of KV per token:
+
+| context | f16 | `q8_0` K+V | `q4_0` K+V |
+|---|---|---|---|
+| 512 (20 chunks) | 6.8003 | 6.8038 (+0.05%) | 6.8130 (+0.19%) |
+| 8192 (4 chunks) | 5.4791 | — | 5.5005 (+0.39%) |
+| 32768 (4 chunks) | 6.1354 | 6.1384 (+0.05%) | 6.1475 (+0.20%) |
+
+At 8k the split is K-only +0.24%, V-only +0.13%, and `q8_0` K + `q4_0` V is
++0.06% — all inside the ±0.10 CI. So the 4-bit regime that collapses the 0.6B
+(+236%) is **essentially free at 27B**, and stays free out to 32k context.
+
+Consequence: the cliff is a property of small models, not of KV quantization.
+The DCT win of §5 sits exactly where the model is already broken, and the models
+that actually have a byte-budget problem (large, long context) do not need it.
+That leaves §5 as a mechanism result — the error shaping is real and reproducible
+— rather than a deployment feature.
+
+(Locally there is also Gemma4-12B, dense with 48 layers, but on wikitext its
+perplexity is ~302 because it is a roleplay finetune; its deltas are dominated by
+the ±23 confidence interval — e.g. `q4_0` K+V +13%, single-side +4%/0%. A
+decisive dense mid-size test needs an in-domain corpus and a distribution metric
+(KL or token agreement) rather than perplexity.)
+
+## 7. Gemma 4 12B: a dense/SWA model, and why perplexity is the wrong metric
+
+Local checkpoint: Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced, GGUF `Q4_K_M`,
+arch `gemma4`, 48 layers = **40 sliding-window layers** (window 1024, 8 KV heads
+x 256 dim) + **8 global layers** (1 KV head x 512 dim), 262k vocab.
+
+Its perplexity is unusable as a measurement: the same quantized tiers give
+baseline 302 on wikitext, 355 on a human-written chat corpus, 2.24 on text the
+model generated itself, and 18.87 on a second self-generated corpus — and in the
+last case *quantizing improves* ppl (18.87 -> 8.84 for `q4_0` K+V), because the
+noise flattens an over-confident distribution. Heavily finetuned models are
+calibrated to their own domain, so ppl measures calibration, not distortion.
+
+Use `llama-perplexity --kl-divergence --save-all-logits` instead (mean KL of the
+quantized distribution against the f16 one, plus top-1 agreement). Corpus =
+20k tokens generated by the model itself, c=2048 x 4 chunks (8192 scored):
+
+| KV | mean KL | ppl ratio | same top-1 |
+|---|---|---|---|
+| f16 (sanity) | 0.000000 | 1.006 | 100.0% |
+| `q8_0` K+V | 0.1678 | 1.034 | 93.4% |
+| `q4_0` K, f16 V | 0.2295 | 1.056 | 90.6% |
+| f16 K, `q4_0` V | 0.2247 | 1.123 | 90.8% |
+| `q4_0` K+V | 0.3027 | 1.127 | 89.1% |
+
+Reading:
+
+- **No cliff at 12B**, but 4-bit is not free either: KL 0.30 vs 0.17 at 8 bits,
+  and top-1 agreement drops to 89%.
+- **K and V contribute equally in KL** (0.2295 vs 0.2247) even though ppl calls V
+  twice as bad (+12.3% vs +5.6%). ppl and distribution distance disagree about
+  which side matters; only the latter is a reliable target.
+- The f16 sanity row also fixes the run noise: KL is exactly 0, while the ppl
+  ratio drifts by 0.6% between identical runs — another reason to report KL.
+
+For comparison, the same KL protocol on the 27B hybrid (wikitext, c=2048 x 4):
+
+| KV | mean KL | ppl ratio | same top-1 |
+|---|---|---|---|
+| `q8_0` K+V | 0.0021 | 0.997 | 97.8% |
+| `q4_0` K+V | 0.0035 | 1.000 | 96.9% |
+
+So the 27B distorts **~86x less** than the 12B at 4 bits. That is not a
+parameter-count effect but an **exposure** effect: in `qwen35` only 17 of 64
+layers have a KV cache (the rest are linear attention with recurrent state that
+`-ctk/-ctv` never touches), while in `gemma4` every layer's attention reads the
+quantized cache. Dense small-to-mid models are therefore the only place where
+KV compression is both wanted and measurably costly — and at 12B the cost of
+4-bit is a KL of 0.30, not a collapse.
+
+Capacity is still not the motivator here: Gemma4-12B keeps ~32 KiB of KV per
+token in its 8 global layers and its 40 SWA layers are capped at the 1024-token
+window, so 8k context costs ~0.9 GiB — there is no byte pressure to relieve.
+
+## 8. HF-side KL pre-judgment across model sizes
+
+Before writing anything into llama.cpp, the same A/B was run inside HF
+(`kv_probe_kl.py`): 16 windows x 1024 tokens, scored on the last 512, fp16,
+wikitext, metric = mean KL(tier || f16) and top-1 agreement. Equal-byte pairs
+are adjacent rows.
+
+| model | tier | KL | top-1 | of fp16 |
+|---|---|---|---|---|
+| Qwen3-8B (36 layers, 8 KV heads, plain dense GQA) | `q8_0` K+V | 0.0009 | 99.2% | 53.1% |
+| | dct b32 + q8 K+V | **0.0005** | 99.1% | 53.1% |
+| | `q4_0` K+V | 0.0802 | 89.0% | 28.1% |
+| | dct b32 + q4 K+V | 0.0852 | 88.4% | 28.1% |
+| | `q8_0` K + `q4_0` V | 0.0047 | 97.3% | 40.6% |
+| | dct b32 + q8 K, q4 V | 0.0045 | 97.2% | 40.6% |
+| | dct b32 + q4 K, q8 V | 0.0541 | 90.5% | 40.6% |
+| Qwen3-0.6B (28 layers, 8 KV heads) | `q8_0` K+V | 0.0168 | 93.8% | 53.1% |
+| | dct b32 + q8 K+V | **0.0056** | **95.8%** | 53.1% |
+| | `q4_0` K+V | 2.3752 | 33.2% | 28.1% |
+| | dct b32 + q4 K+V | 1.0283 | 53.0% | 28.1% |
+| Hy-MT2-1.8B (32 layers, 4 KV heads) | `q8_0` K+V | 0.0002 | 99.4% | 53.1% |
+| | dct b32 + q8 K+V | 0.0003 | 99.2% | 53.1% |
+| | `q4_0` K+V | 0.0364 | 90.4% | 28.1% |
+| | dct b32 + q4 K+V | 0.0968 | 85.0% | 28.1% |
+| Gemma4-E2B (35 layers, 7 full + 28 SWA, 1 KV head) | `q8_0` K+V | 0.0025 | 98.3% | 22.8% |
+| | dct b32 + q8 K+V | 0.0028 | 98.1% | 22.8% |
+| | `q4_0` K+V | 0.2788 | 79.7% | 12.1% |
+| | dct b32 + q4 K+V | 0.3301 | 78.8% | 12.1% |
+
+Qwen3-8B is the decisive row because it is the architecture the codec was
+designed against — plain dense GQA, no SWA, no hybrid, no MQA:
+
+- At the operating point that actually matters — `q8_0` K + `q4_0` V, 40.6% of
+  fp16 bytes — the transform changes **nothing**: KL 0.0047 raw vs 0.0045 with
+  DCT on K, top-1 97.3% vs 97.2%. Spending the 4 bits on V instead of K is worth
+  10× more than transforming K.
+- At 8 bits both are effectively free (0.0009 vs 0.0005).
+- At 4 bits on both sides the transform is **6% worse** (0.0802 -> 0.0852).
+- K is again ~18× more sensitive than V (0.0748 vs 0.0042 at `q4_0`), i.e. the
+  K/V asymmetry of Qwen3-0.6B is an architecture property, not a size effect.
+
+Across all four models the transform wins only where raw row quantization is
+already destructive (0.6B: 3× lower KL at 8 bits, 2.3× at 4 bits — and there
+4-bit stays broken), is neutral or slightly better at 8 bits elsewhere, and is
+worse at 4 bits except on the model that is already broken.
+
+**Verdict: do not implement this in llama.cpp** (no S2, no kernel). The cheap
+pre-judgment answers the question in an afternoon instead of a week, and a plain
+dense 8B — the most favourable case for the codec — closes it.
+
+Caveats: 8k–16k scored tokens per model; the harness keeps the full 1024-token
+history for SWA layers (no window cropping), so the byte ratios are relative to
+an uncropped fp16 cache; the 0.6B/1.8B/Gemma4 checkpoints are finetunes (the
+Qwen3-8B one is the base model); the DCT is applied to every layer.
+
+## 9. What this means for flashcodec
+
+- The seq-axis transform is a **real distortion win at equal bytes**, but only
+  where row quantization is already destructive: 3× lower KL at 8 bits and 2.3×
+  at 4 bits on Qwen3-0.6B, and **neutral at 8 bits / worse at 4 bits** on
+  1.8–2B models that quantize cleanly (§8). Combined with 4-bit still being
+  broken at 0.6B (KL 1.03, top-1 53%), there is no operating point where the
+  codec is worth shipping: **no llama.cpp implementation follows from this.**
+- What the exercise did produce is a set of transferable measurements:
+  the coefficient quantizer, not the transform, decides the earlier verdict
+  (§5); the error is redistributed rather than reduced (§5); perplexity and KL
+  disagree about which side (K or V) matters (§7); and KV-quantization damage is
+  driven by architectural exposure more than by parameter count (§6–§7).
+- **Metric discipline**: use KL / top-1 agreement (`--kl-divergence`) for
+  finetuned or dense models — their ppl is a calibration artifact and sometimes
+  *improves* under quantization. ppl is only informative on base models with a
+  sane baseline (the 0.6B and 27B rows).
+- Deployment advice is unchanged and now has a calibration-free backing:
+  `-ctk q8_0 -ctv q4_0` on base models (40.6% of fp16 KV), never `-ctk q4_0` on
+  a small dense model (KL 2.4, top-1 33% at 0.6B).
+
+## 10. Limitations
+
+- One model (Qwen3-0.6B), one context length (512). Longer contexts usually make
+  KV quantization *more* damaging, but they should not reorder DCT vs row
+  quantization, because the two have different error mechanisms.
+- HF bf16 vs llama.cpp fp16; `q8_0 emul` is a semantic emulation, not bit-exact.
+- Hybrid models (Qwen3.5-0.8B) are not re-measured here: only 6 of 24 layers
+  carry a codec there, so the absolute damage is small, but at equal bytes those
+  six layers are still better served by `q8_0`.
+- Capacity: at 0.6B and 128k context, `K=q8_0 + V=q4_0` needs only ~4.7 GB, so
+  there is no VRAM pressure on a 32 GB card. The capacity argument only bites
+  for large models at very long context — where `q8_0` K + `q4_0` V is still the
+  cheaper answer.
+
+## 11. Reproduce
+
+```bash
+# convert (needs the `gguf` + `sentencepiece` python packages)
+python llama.cpp/convert_hf_to_gguf.py <qwen3-0.6b-hf-dir> \
+    --outfile qwen3-0.6b-f16.gguf --outtype f16
+
+# llama.cpp matrix
+llama.cpp/build/bin/llama-perplexity -m qwen3-0.6b-f16.gguf \
+    -f wikitext-2-raw/wiki.test.raw -c 512 --chunks 40 \
+    -ngl 99 -fa on -ctk q8_0 -ctv q4_0
+
+llama.cpp/build/bin/llama-bench -m qwen3-0.6b-f16.gguf \
+    -p 4096 -n 32 -fa 1 -ngl 99 -ctk q8_0 -ctv q8_0 -r 3
+```
+
+The HF-side A/B harness (K-only / V in {raw, quant, codec}, ggml-style row
+quantization emulation, DCT tiers) is a standalone script kept with the
+experiment record; it is not part of the published package.
+
+## Appendix: why this is about KV and not about model weights
+
+The original idea was JPEG-for-weights: keep only the low-frequency
+coefficients and shrink the model by 75%. That needs an autocorrelated axis,
+and weights do not have one — an `(out, in)` matrix has no sequence axis, and
+its trained spectrum is flat (high stable rank), so "keep the low-frequency
+quarter" degenerates into a low-rank truncation that costs far more than 75% of
+the information. The same asymmetry was measured here on KV: truncation needs
+**2.7× the bytes** of block quantization for the same damage (§2).
+
+The workable form of the same intuition is not truncation but **rotate, then
+quantize**: Hadamard / random rotations spread the energy before per-block
+quantization (QuaRot, SpinQuant; llama.cpp ships this as `hdmd`), and hybrid
+low-rank-plus-quantization keeps the dominant subspace while encoding the rest
+at a lower bit width (SVD-LLM, ASVD). If the weights route is ever revisited,
+the cheapest test is one afternoon on a local dense model — at a fixed 25% of
+fp16 bytes, compare (a) per-matrix 2-D DCT truncation, (b) Hadamard +
+per-block 4-bit, (c) SVD rank-r, on perplexity.
+
+### Two conditions the JPEG analogy needs
+
+Transform coding only pays off when (a) the transform concentrates energy and
+(b) an *autocorrelated axis that carries the damage* exists at all. Both are
+measurable, and text KV fails them differently from image patches:
+
+- **Energy concentration**: for a first-order process `Var(Δ)/Var(X) = 2(1−ρ)`.
+  The measured text-KV statistics map to ρ ≈ 0.64–0.92 for K (smooth — the
+  transform does work, and it is the side that benefits in every run above) and
+  ρ ≈ −0.07–0.82 for V (often anti-correlated — the transform cannot help).
+- **A naive baseline quantizer**: JPEG beats *uniform* quantization because its
+  table adds frequency adaptation. ggml's per-32 absmax is already an adaptive
+  table, so most of that gain is spent before the transform arrives — this is
+  exactly the 0.6B / 1.8B / 8B spread in §8.
+- **The damage is not in the frequency domain**: K is the sensitive side because
+  of outlier channels along `head_dim`, not because of its spectrum. So the
+  effective "signal processing before quantization" for K is a **rotation along
+  `head_dim`** (QuaRot, SpinQuant; shipped in llama.cpp as `hdmd`) — the same
+  architecture of idea as this project, applied to the axis where the error
+  actually lives.

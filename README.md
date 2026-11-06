@@ -213,18 +213,20 @@ Same Qwen3-0.6B, 16 x 512-token windows, profile calibrated on a disjoint
 
 | tier | ppl | dppl | storage |
 |---|---|---|---|
-| baseline | 31.1504 | — | 100% |
-| k=8 b=8 | 31.6745 | +0.524 | 51.6% |
-| k=8 b=8 + profile | 31.1210 | −0.029 | 51.6% |
-| k=8 b=7 | 33.4916 | +2.341 | 45.3% |
-| **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
-| k=8 b=6 | 47.2046 | +16.05 | 39.1% |
-| k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+| baseline | 35.8389 | — | 100% |
+| k=8 b=8 | 36.1957 | +0.357 | 51.6% |
+| k=8 b=8 + profile | 35.8191 | −0.020 | 51.6% |
+| k=8 b=7 | 38.4819 | +2.643 | 45.3% |
+| **k=8 b=7 + profile** | **36.0390** | **+0.200** | **45.3%** |
+| k=8 b=6 | 54.5809 | +18.742 | 39.1% |
+| k=8 b=6 + profile | 36.0494 | +0.211 | 39.1% |
 
-Hybrid Qwen3.5-0.8B (only 6/24 layers carry a codec, baseline 23.5318):
-b=7 + profile +0.015, b=6 + profile −0.010. Reproduce with
-`python benchmarks/bench_calibrated.py` (windows are built from the repository's
-own markdown; the calibration slice never overlaps the eval windows).
+Hybrid Qwen3.5-0.8B (only 6/24 layers carry a codec, baseline 27.1271):
+b=7 + profile −0.006, b=6 + profile +0.037. Reproduce with
+`python benchmarks/bench_calibrated.py` — the windows come from the frozen
+`docs/eval-corpus.txt` (a snapshot of this repository's markdown), so editing
+the docs does not move these numbers; the calibration slice never overlaps the
+eval windows.
 
 The profile is a codec constant, so decode pays one broadcast multiply:
 at 64K / k=8 the Triton path goes 0.371 -> 0.414 ms per layer; 7-bit adds the
@@ -376,7 +378,7 @@ generated tokens are identical. Two caveats: the MLA latent is already ~7x
 smaller than a GQA cache (576 vs 4096 elements/token/layer at 16 heads x 128),
 and transformers' `expand_kv` rebuilds the per-head keys/values on every
 forward, so only the *stored* cache shrinks — the 4K decode step measured
-954 ms raw vs 959 ms with the codec. When the checkpoint does not fit on one
+1.00 s raw vs 1.03 s with the codec. When the checkpoint does not fit on one
 device, export with `--device-map auto` (needs `accelerate`; it budgets 80% of
 free VRAM plus host RAM, and `--max-gpu-gib` overrides the VRAM figure).
 

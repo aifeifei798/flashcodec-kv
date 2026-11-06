@@ -189,17 +189,18 @@ apply_flash_codec(model, mode="jpeg", keep_freqs=8, quant_bits=7,
 
 | 档位 | ppl | Δ | 存储 |
 |---|---|---|---|
-| baseline | 31.1504 | — | 100% |
-| k=8 b=8 | 31.6745 | +0.524 | 51.6% |
-| k=8 b=8 + profile | 31.1210 | −0.029 | 51.6% |
-| k=8 b=7 | 33.4916 | +2.341 | 45.3% |
-| **k=8 b=7 + profile** | **31.1750** | **+0.025** | **45.3%** |
-| k=8 b=6 | 47.2046 | +16.05 | 39.1% |
-| k=8 b=6 + profile | 31.3993 | +0.249 | 39.1% |
+| baseline | 35.8389 | — | 100% |
+| k=8 b=8 | 36.1957 | +0.357 | 51.6% |
+| k=8 b=8 + profile | 35.8191 | −0.020 | 51.6% |
+| k=8 b=7 | 38.4819 | +2.643 | 45.3% |
+| **k=8 b=7 + profile** | **36.0390** | **+0.200** | **45.3%** |
+| k=8 b=6 | 54.5809 | +18.742 | 39.1% |
+| k=8 b=6 + profile | 36.0494 | +0.211 | 39.1% |
 
-混合架构 Qwen3.5-0.8B（只有 6/24 层挂 codec，baseline 23.5318）：b=7 + profile
-+0.015、b=6 + profile −0.010。复现：`python benchmarks/bench_calibrated.py`
-（默认用仓库自带 markdown 组窗口，校准切片与评测窗口不重叠）。
+混合架构 Qwen3.5-0.8B（只有 6/24 层挂 codec，baseline 27.1271）：b=7 + profile
+−0.006、b=6 + profile +0.037。复现：`python benchmarks/bench_calibrated.py`
+（窗口取自冻结的 `docs/eval-corpus.txt`——本仓库 markdown 的快照，改文档不会移动
+这些数字；校准切片与评测窗口不重叠）。
 
 profile 是 codec 常量，解码只多一次 broadcast 乘：64K、k=8 时 0.371 → 0.414
 ms/层；7-bit 的 gather 解包再翻一倍到 0.767 ms/层。`per_layer` 也可以只覆盖部分层。
@@ -335,7 +336,7 @@ profile → `generate` 直接生效。已经自己加载好模型的，用
 两个注意点：MLA latent 本身已经比 GQA cache 小约 7 倍（16 头 × 128 维时每 token
 每层 576 vs 4096 个元素），而 transformers 的 `expand_kv` 每次前向都会把每头
 K/V 重新展开，所以缩小的只是**存储的 cache** —— 4K 上下文解码单步实测
-954 ms（原始）vs 959 ms（带 codec）。模型单卡放不下时用
+1.00 s（原始）vs 1.03 s（带 codec）。模型单卡放不下时用
 `--device-map auto` 导出（需要 `accelerate`；默认按空闲显存的 80% + 主机内存规划，
 `--max-gpu-gib` 可覆盖显存那一项）。
 
